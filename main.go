@@ -421,6 +421,9 @@ func attach(sock string) error {
 					inputErr <- nil
 					return
 				}
+				if isMouseWheelInput(chunk) {
+					continue
+				}
 				if err := writeFrame(conn, frameInput, chunk); err != nil {
 					inputErr <- err
 					return
@@ -696,6 +699,50 @@ func enhancedDetachInput(buf []byte, ctrl byte) bool {
 		}
 	}
 	return false
+}
+
+func isMouseWheelInput(buf []byte) bool {
+	if len(buf) < 6 || buf[0] != 0x1b || buf[1] != '[' {
+		return false
+	}
+	if isSGRMouseWheel(buf) || isURXVTMouseWheel(buf) || isX10MouseWheel(buf) {
+		return true
+	}
+	return false
+}
+
+func isSGRMouseWheel(buf []byte) bool {
+	if len(buf) < 9 || buf[2] != '<' {
+		return false
+	}
+	last := buf[len(buf)-1]
+	if last != 'M' && last != 'm' {
+		return false
+	}
+	var cb, x, y int
+	if _, err := fmt.Sscanf(string(buf[3:]), "%d;%d;%d%c", &cb, &x, &y, &last); err != nil {
+		return false
+	}
+	return cb&64 != 0
+}
+
+func isURXVTMouseWheel(buf []byte) bool {
+	if len(buf) < 8 || buf[len(buf)-1] != 'M' {
+		return false
+	}
+	var cb, x, y int
+	if _, err := fmt.Sscanf(string(buf[2:]), "%d;%d;%dM", &cb, &x, &y); err != nil {
+		return false
+	}
+	return cb&64 != 0
+}
+
+func isX10MouseWheel(buf []byte) bool {
+	if len(buf) != 6 || buf[2] != 'M' {
+		return false
+	}
+	cb := int(buf[3]) - 32
+	return cb&64 != 0
 }
 
 func ctrlToKeyCode(ctrl byte) int {
