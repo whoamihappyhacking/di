@@ -8,7 +8,7 @@
 d codex --yolo
 ```
 
-按 `Ctrl-I` 断开后，命令仍在后台运行。之后可以用：
+按 `Ctrl-G` 断开后，命令仍在后台运行。之后可以用：
 
 ```sh
 di
@@ -63,7 +63,13 @@ d codex --yolo
 断开当前 attach：
 
 ```text
-Ctrl-I
+Ctrl-G
+```
+
+如果想临时换 detach 快捷键，可以设置 `D_DETACH`：
+
+```sh
+D_DETACH='^]' di
 ```
 
 重新进入：

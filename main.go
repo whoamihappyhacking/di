@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const detachKey = "^I"
+const defaultDetachKey = "^G"
 
 //go:embed assets/dtach-linux-amd64
 var embeddedDtach []byte
@@ -309,11 +309,18 @@ func attach(sock string) error {
 		fmt.Print("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
 		defer fmt.Print("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")
 	}
-	cmd := exec.Command(dtach, "-a", sock, "-e", detachKey, "-r", "ctrl_l")
+	cmd := exec.Command(dtach, "-a", sock, "-e", detachKey(), "-r", "ctrl_l")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func detachKey() string {
+	if key := os.Getenv("D_DETACH"); key != "" {
+		return key
+	}
+	return defaultDetachKey
 }
 
 func dtachPath() (string, error) {
