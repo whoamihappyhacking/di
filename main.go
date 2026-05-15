@@ -207,6 +207,9 @@ func pickAndAttach() error {
 	go copyLines(stdin, lines)
 	out, err := cmd.Output()
 	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 130 {
+			return nil
+		}
 		return err
 	}
 	selected := strings.TrimSpace(string(out))
