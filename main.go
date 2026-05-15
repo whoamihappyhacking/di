@@ -486,7 +486,6 @@ func (s *ptyServer) handle(conn net.Conn) {
 				rows := binary.BigEndian.Uint32(payload[:4])
 				cols := binary.BigEndian.Uint32(payload[4:])
 				_ = pty.Setsize(s.master, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
-				_, _ = s.master.Write([]byte{'\f'})
 			}
 		case frameDetachAll:
 			s.closeClients()
