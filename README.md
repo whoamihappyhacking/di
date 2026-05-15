@@ -8,7 +8,7 @@
 d codex --yolo
 ```
 
-按 `Ctrl-]` 断开后，命令仍在后台运行。之后可以用：
+按 `Ctrl-I` 断开后，命令仍在后台运行。之后可以用：
 
 ```sh
 di
@@ -63,7 +63,7 @@ d codex --yolo
 断开当前 attach：
 
 ```text
-Ctrl-]
+Ctrl-I
 ```
 
 重新进入：

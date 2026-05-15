@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const detachKey = "^]"
+const detachKey = "^I"
 
 //go:embed assets/dtach-linux-amd64
 var embeddedDtach []byte
