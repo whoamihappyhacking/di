@@ -8,7 +8,7 @@
 d codex --yolo
 ```
 
-按 `Ctrl-G` 断开后，命令仍在后台运行。之后可以用：
+按 `Ctrl-B` 断开后，命令仍在后台运行。之后可以用：
 
 ```sh
 di
@@ -24,13 +24,7 @@ di
 - `d --detach <name>`：从外部断开某个 attach 客户端
 - `d install`：从源码安装到 `~/.local/bin`
 - 默认保留终端鼠标选择/复制能力
-- 内置静态 Linux x86_64 `dtach`，用户不需要额外安装 `dtach`
-
-如果系统里已有 `dtach`，会优先使用系统版本；否则会自动释放内置版本到：
-
-```text
-~/.cache/di/
-```
+- 纯 Go 实现，不依赖 `dtach`
 
 ## 安装
 
@@ -63,7 +57,7 @@ d codex --yolo
 断开当前 attach：
 
 ```text
-Ctrl-G
+Ctrl-B
 ```
 
 如果想临时换 detach 快捷键，可以设置 `D_DETACH`：

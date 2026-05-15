@@ -2,32 +2,38 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha256"
-	_ "embed"
-	"encoding/hex"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-const defaultDetachKey = "^G"
-
-//go:embed assets/dtach-linux-amd64
-var embeddedDtach []byte
+const (
+	defaultDetachKey = "^B"
+	frameInput       = 'i'
+	frameResize      = 'w'
+	frameDetachAll   = 'D'
+)
 
 func main() {
-	name := filepath.Base(os.Args[0])
 	var err error
-	if len(os.Args) > 1 && os.Args[1] == "install" {
+	if len(os.Args) > 1 && os.Args[1] == "--server" {
+		err = runServer(os.Args[2:])
+	} else if len(os.Args) > 1 && os.Args[1] == "install" {
 		err = installSelf()
-	} else if name == "di" {
+	} else if filepath.Base(os.Args[0]) == "di" {
 		err = pickAndAttach()
 	} else {
 		err = runD(os.Args[1:])
@@ -46,9 +52,6 @@ func runD(args []string) error {
 		return installSelf()
 	}
 
-	if _, err := dtachPath(); err != nil {
-		return err
-	}
 	dir, err := sessionDir()
 	if err != nil {
 		return err
@@ -70,7 +73,7 @@ func runD(args []string) error {
 	if isSocket(sock) {
 		return attach(sock)
 	}
-	if err := createDetached(sock, args); err != nil {
+	if err := startServer(sock, args); err != nil {
 		return err
 	}
 	if err := waitSocket(sock, 2*time.Second); err != nil {
@@ -171,9 +174,6 @@ func hasProjectFiles(dir string) bool {
 }
 
 func pickAndAttach() error {
-	if _, err := dtachPath(); err != nil {
-		return err
-	}
 	if _, err := exec.LookPath("fzf"); err != nil {
 		return errors.New("di: fzf is not installed")
 	}
@@ -182,9 +182,9 @@ func pickAndAttach() error {
 		return err
 	}
 	if len(socks) == 0 {
-		return errors.New("di: no dtach sessions found")
+		return errors.New("di: no sessions found")
 	}
-	cmd := exec.Command("fzf", "--prompt=dtach> ", "--height=40%", "--reverse")
+	cmd := exec.Command("fzf", "--prompt=di> ", "--height=40%", "--reverse")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -203,13 +203,13 @@ func pickAndAttach() error {
 
 func sessionDir() (string, error) {
 	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		return filepath.Join(xdg, "dtach"), nil
+		return filepath.Join(xdg, "di"), nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".local", "state", "dtach"), nil
+	return filepath.Join(home, ".local", "state", "di"), nil
 }
 
 func allSockets() ([]string, error) {
@@ -217,25 +217,18 @@ func allSockets() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	home, _ := os.UserHomeDir()
-	dirs := []string{dir}
-	if home != "" {
-		fallback := filepath.Join(home, ".local", "state", "dtach")
-		if fallback != dir {
-			dirs = append(dirs, fallback)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
+		return nil, err
 	}
 	var socks []string
-	for _, d := range dirs {
-		entries, err := os.ReadDir(d)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			path := filepath.Join(d, e.Name())
-			if strings.HasSuffix(e.Name(), ".sock") && isSocket(path) {
-				socks = append(socks, path)
-			}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		if strings.HasSuffix(e.Name(), ".sock") && isSocket(path) {
+			socks = append(socks, path)
 		}
 	}
 	return socks, nil
@@ -276,17 +269,25 @@ func isSocket(path string) bool {
 	return info.Mode()&os.ModeSocket != 0
 }
 
-func createDetached(sock string, args []string) error {
-	dtach, err := dtachPath()
+func startServer(sock string, args []string) error {
+	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	dargs := append([]string{"-n", sock, "-r", "ctrl_l"}, args...)
-	cmd := exec.Command(dtach, dargs...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer devNull.Close()
+	cmd := exec.Command(exe, append([]string{"--server", sock}, args...)...)
+	cmd.Stdin = devNull
+	cmd.Stdout = devNull
+	cmd.Stderr = devNull
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
 }
 
 func waitSocket(sock string, timeout time.Duration) error {
@@ -301,81 +302,365 @@ func waitSocket(sock string, timeout time.Duration) error {
 }
 
 func attach(sock string) error {
-	dtach, err := dtachPath()
+	conn, err := net.Dial("unix", sock)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
+
+	oldTerm, err := makeRaw(0)
+	if err != nil {
+		return err
+	}
+	defer restoreTerm(0, oldTerm)
+
 	if mouseEnabled() {
 		fmt.Print("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
 		defer fmt.Print("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")
 	}
-	cmd := exec.Command(dtach, "-a", sock, "-e", detachKey(), "-r", "ctrl_l")
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
+	_ = sendWindowSize(conn)
+	go watchWindowSize(conn)
 
-func detachKey() string {
-	if key := os.Getenv("D_DETACH"); key != "" {
-		return key
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(os.Stdout, conn)
+		close(done)
+	}()
+
+	inputErr := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if n > 0 {
+				chunk := buf[:n]
+				if isDetachInput(chunk) {
+					inputErr <- nil
+					return
+				}
+				if err := writeFrame(conn, frameInput, chunk); err != nil {
+					inputErr <- err
+					return
+				}
+			}
+			if err != nil {
+				inputErr <- err
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case err := <-inputErr:
+		return err
 	}
-	return defaultDetachKey
 }
 
-func dtachPath() (string, error) {
-	if path, err := exec.LookPath("dtach"); err == nil {
-		return path, nil
+func runServer(args []string) error {
+	if len(args) < 2 {
+		return errors.New("usage: d --server <socket> <command> [args...]")
 	}
-	return embeddedDtachPath()
-}
+	sock := args[0]
+	cmdArgs := args[1:]
 
-func embeddedDtachPath() (string, error) {
-	home, err := os.UserHomeDir()
+	if err := os.MkdirAll(filepath.Dir(sock), 0o700); err != nil {
+		return err
+	}
+	_ = os.Remove(sock)
+	ln, err := net.Listen("unix", sock)
 	if err != nil {
-		return "", err
+		return err
 	}
-	sum := sha256.Sum256(embeddedDtach)
-	short := hex.EncodeToString(sum[:])[:16]
-	dir := filepath.Join(home, ".cache", "di")
-	path := filepath.Join(dir, "dtach-linux-amd64-"+short)
-	if executableFile(path) {
-		return path, nil
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	tmp, err := os.CreateTemp(dir, ".dtach-*")
+	defer os.Remove(sock)
+	defer ln.Close()
+
+	master, slave, err := openPTY()
 	if err != nil {
-		return "", err
+		return err
 	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(embeddedDtach); err != nil {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-		return "", err
+	defer master.Close()
+	defer slave.Close()
+
+	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
+	cmd.Stdin = slave
+	cmd.Stdout = slave
+	cmd.Stderr = slave
+	cmd.Env = os.Environ()
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
+	if err := cmd.Start(); err != nil {
+		return err
 	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", err
+	_ = slave.Close()
+
+	server := &ptyServer{master: master, clients: map[net.Conn]struct{}{}}
+	go server.broadcastPTY()
+	go func() {
+		_ = cmd.Wait()
+		_ = ln.Close()
+		_ = master.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return nil
+		}
+		server.add(conn)
+		go server.handle(conn)
 	}
-	if err := os.Chmod(tmpPath, 0o755); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return "", err
-	}
-	return path, nil
 }
 
-func executableFile(path string) bool {
-	info, err := os.Stat(path)
+type ptyServer struct {
+	mu      sync.Mutex
+	master  *os.File
+	clients map[net.Conn]struct{}
+	history []byte
+}
+
+func (s *ptyServer) add(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clients[conn] = struct{}{}
+	if len(s.history) > 0 {
+		_, _ = conn.Write(s.history)
+	}
+}
+
+func (s *ptyServer) remove(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clients, conn)
+	_ = conn.Close()
+}
+
+func (s *ptyServer) closeClients() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for conn := range s.clients {
+		_ = conn.Close()
+		delete(s.clients, conn)
+	}
+}
+
+func (s *ptyServer) broadcastPTY() {
+	buf := make([]byte, 4096)
+	for {
+		n, err := s.master.Read(buf)
+		if n > 0 {
+			s.mu.Lock()
+			s.appendHistory(buf[:n])
+			for conn := range s.clients {
+				if _, werr := conn.Write(buf[:n]); werr != nil {
+					_ = conn.Close()
+					delete(s.clients, conn)
+				}
+			}
+			s.mu.Unlock()
+		}
+		if err != nil {
+			s.closeClients()
+			return
+		}
+	}
+}
+
+func (s *ptyServer) appendHistory(p []byte) {
+	const maxHistory = 1 << 20
+	s.history = append(s.history, p...)
+	if len(s.history) > maxHistory {
+		s.history = append([]byte(nil), s.history[len(s.history)-maxHistory:]...)
+	}
+}
+
+func (s *ptyServer) handle(conn net.Conn) {
+	defer s.remove(conn)
+	for {
+		typ, payload, err := readFrame(conn)
+		if err != nil {
+			return
+		}
+		switch typ {
+		case frameInput:
+			_, _ = s.master.Write(payload)
+		case frameResize:
+			if len(payload) == 8 {
+				rows := binary.BigEndian.Uint32(payload[:4])
+				cols := binary.BigEndian.Uint32(payload[4:])
+				_ = unix.IoctlSetWinsize(int(s.master.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: uint16(rows), Col: uint16(cols)})
+				_, _ = s.master.Write([]byte{'\f'})
+			}
+		case frameDetachAll:
+			s.closeClients()
+			return
+		}
+	}
+}
+
+func openPTY() (*os.File, *os.File, error) {
+	masterFD, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := unix.IoctlSetPointerInt(masterFD, unix.TIOCSPTLCK, 0); err != nil {
+		_ = unix.Close(masterFD)
+		return nil, nil, err
+	}
+	n, err := unix.IoctlGetInt(masterFD, unix.TIOCGPTN)
+	if err != nil {
+		_ = unix.Close(masterFD)
+		return nil, nil, err
+	}
+	slaveFD, err := unix.Open(fmt.Sprintf("/dev/pts/%d", n), unix.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		_ = unix.Close(masterFD)
+		return nil, nil, err
+	}
+	return os.NewFile(uintptr(masterFD), "pty-master"), os.NewFile(uintptr(slaveFD), "pty-slave"), nil
+}
+
+func makeRaw(fd int) (*unix.Termios, error) {
+	t, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return nil, err
+	}
+	raw := *t
+	raw.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON | unix.IXOFF
+	raw.Oflag &^= unix.OPOST
+	raw.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
+	raw.Cflag &^= unix.CSIZE | unix.PARENB
+	raw.Cflag |= unix.CS8
+	raw.Cc[unix.VMIN] = 1
+	raw.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &raw); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func restoreTerm(fd int, term *unix.Termios) {
+	_ = unix.IoctlSetTermios(fd, unix.TCSETS, term)
+	fmt.Print("\x1b[?25h")
+}
+
+func sendWindowSize(w io.Writer) error {
+	ws, err := unix.IoctlGetWinsize(0, unix.TIOCGWINSZ)
+	if err != nil {
+		return nil
+	}
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint32(payload[:4], uint32(ws.Row))
+	binary.BigEndian.PutUint32(payload[4:], uint32(ws.Col))
+	return writeFrame(w, frameResize, payload)
+}
+
+func watchWindowSize(w io.Writer) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGWINCH)
+	for range ch {
+		_ = sendWindowSize(w)
+	}
+}
+
+func writeFrame(w io.Writer, typ byte, payload []byte) error {
+	var header [5]byte
+	header[0] = typ
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	if _, err := w.Write(header[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
+}
+
+func readFrame(r io.Reader) (byte, []byte, error) {
+	var header [5]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, nil, err
+	}
+	n := binary.BigEndian.Uint32(header[1:])
+	if n > 1<<20 {
+		return 0, nil, errors.New("frame too large")
+	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return 0, nil, err
+	}
+	return header[0], payload, nil
+}
+
+func detachSession(sock string) error {
+	conn, err := net.Dial("unix", sock)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return writeFrame(conn, frameDetachAll, nil)
+}
+
+func isDetachInput(buf []byte) bool {
+	key := detachKeyByte()
+	if len(buf) == 1 && buf[0] == key {
+		return true
+	}
+	return enhancedDetachInput(buf, key)
+}
+
+func detachKeyByte() byte {
+	key := os.Getenv("D_DETACH")
+	if key == "" {
+		key = defaultDetachKey
+	}
+	if len(key) >= 2 && key[0] == '^' {
+		if key[1] == '?' {
+			return 0x7f
+		}
+		return key[1] & 0x1f
+	}
+	return key[0]
+}
+
+func enhancedDetachInput(buf []byte, ctrl byte) bool {
+	if len(buf) < 6 || buf[0] != 0x1b || buf[1] != '[' {
 		return false
 	}
-	return info.Mode().IsRegular() && info.Mode()&0o111 != 0
+	key := ctrlToKeyCode(ctrl)
+	s := string(buf[2:])
+	var code, mod int
+	if strings.HasSuffix(s, "u") {
+		if _, err := fmt.Sscanf(s, "%d;%du", &code, &mod); err == nil {
+			return ctrlModifier(mod) && code == key
+		}
+	}
+	if strings.HasSuffix(s, "~") {
+		if _, err := fmt.Sscanf(s, "27;%d;%d~", &mod, &code); err == nil {
+			return ctrlModifier(mod) && code == key
+		}
+	}
+	return false
+}
+
+func ctrlToKeyCode(ctrl byte) int {
+	if ctrl >= 1 && ctrl <= 26 {
+		return int('a' + ctrl - 1)
+	}
+	switch ctrl {
+	case 28:
+		return '\\'
+	case 29:
+		return ']'
+	case 30:
+		return '^'
+	case 31:
+		return '_'
+	default:
+		return int(ctrl)
+	}
+}
+
+func ctrlModifier(mod int) bool {
+	return mod > 1 && ((mod-1)&4) != 0
 }
 
 func mouseEnabled() bool {
@@ -385,40 +670,6 @@ func mouseEnabled() bool {
 	default:
 		return false
 	}
-}
-
-func detachSession(sock string) error {
-	pids, err := attachPIDs(sock)
-	if err != nil {
-		return err
-	}
-	for _, pid := range pids {
-		_ = syscall.Kill(pid, syscall.SIGTERM)
-	}
-	return nil
-}
-
-func attachPIDs(sock string) ([]int, error) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil, err
-	}
-	var pids []int
-	for _, e := range entries {
-		var pid int
-		if _, err := fmt.Sscanf(e.Name(), "%d", &pid); err != nil {
-			continue
-		}
-		cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
-		if err != nil {
-			continue
-		}
-		fields := strings.Split(strings.TrimRight(string(cmdline), "\x00"), "\x00")
-		if len(fields) >= 3 && filepath.Base(fields[0]) == "dtach" && fields[1] == "-a" && fields[2] == sock {
-			pids = append(pids, pid)
-		}
-	}
-	return pids, nil
 }
 
 func copyLines(w io.WriteCloser, lines []string) {
