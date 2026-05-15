@@ -315,10 +315,6 @@ func attach(sock string) error {
 	}
 	defer restoreTerm(0, oldTerm)
 
-	if mouseEnabled() {
-		fmt.Print("\x1b[?1000h\x1b[?1002h\x1b[?1006h")
-		defer fmt.Print("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l")
-	}
 	_ = sendWindowSize(conn)
 	go watchWindowSize(conn)
 
@@ -629,15 +625,6 @@ func ctrlToKeyCode(ctrl byte) int {
 
 func ctrlModifier(mod int) bool {
 	return mod > 1 && ((mod-1)&4) != 0
-}
-
-func mouseEnabled() bool {
-	switch strings.ToLower(os.Getenv("D_MOUSE")) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
 }
 
 func copyLines(w io.WriteCloser, lines []string) {
