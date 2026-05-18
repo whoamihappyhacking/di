@@ -2,6 +2,17 @@
 
 `di` 是一个可断开、可重新进入的终端会话工具。它用 Go 自己管理 PTY 和 Unix socket，不依赖 `dtach`。
 
+## 依赖
+
+`di` 使用 `fzf` 选择已有会话；请先确保 `fzf` 已安装并在 `PATH` 中。
+
+启动新会话和列出会话不依赖 `fzf`：
+
+```sh
+d <command> [args...]
+d --list
+```
+
 ## 安装
 
 ```sh
