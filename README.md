@@ -33,6 +33,13 @@ go build -o di .
 
 ## 用法
 
+查看命令说明：
+
+```sh
+d --help
+di --help
+```
+
 启动一个会话：
 
 ```sh

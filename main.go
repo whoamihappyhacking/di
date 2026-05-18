@@ -39,6 +39,10 @@ type sessionMeta struct {
 
 func main() {
 	var err error
+	if len(os.Args) > 1 && isHelpArg(os.Args[1]) {
+		fmt.Print(helpText())
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "--server" {
 		err = runServer(os.Args[2:])
 	} else if len(os.Args) > 1 && os.Args[1] == "install" {
@@ -60,6 +64,10 @@ func runD(args []string) error {
 	}
 	if args[0] == "install" {
 		return installSelf()
+	}
+	if isHelpArg(args[0]) {
+		fmt.Print(helpText())
+		return nil
 	}
 
 	dir, err := sessionDir()
@@ -96,6 +104,32 @@ func runD(args []string) error {
 
 func usage() string {
 	return "usage: d <command> [args...]\n       d install\n       d --list\n       d --detach <name>"
+}
+
+func isHelpArg(arg string) bool {
+	return arg == "--help" || arg == "-h"
+}
+
+func helpText() string {
+	return `di - detachable terminal sessions
+
+Usage:
+  d <command> [args...]       start a new detachable session and attach to it
+  di                          pick an existing session with fzf and attach to it
+  d --list                    list active sessions
+  d --detach <name>           detach all clients from a session
+  d install                   install the current binary to ~/.local/bin/d and link di
+  d --help, di --help         show this help
+
+Keys:
+  Ctrl-]                      detach from the current session
+
+Environment:
+  D_DETACH=^B                 override the detach key
+
+Notes:
+  di requires fzf to pick sessions. Starting and listing sessions do not.
+`
 }
 
 func installSelf() error {
