@@ -593,7 +593,7 @@ func (s *ptyServer) broadcastPTY() {
 }
 
 func (s *ptyServer) appendHistory(p []byte) {
-	const maxHistory = 1 << 20
+	const maxHistory = 64 << 10
 	s.history = append(s.history, p...)
 	if len(s.history) > maxHistory {
 		s.history = append([]byte(nil), s.history[len(s.history)-maxHistory:]...)
