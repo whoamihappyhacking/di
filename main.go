@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,6 +29,11 @@ const (
 	frameResize      = 'w'
 	frameDetachAll   = 'D'
 	dialTimeout      = 200 * time.Millisecond
+	serverStartWait  = 2 * time.Second
+	// Keep fast command output available until the launching client can attach.
+	initialAttachWait = serverStartWait + time.Second
+	// Linux allows 107 pathname bytes; 103 also fits macOS sockaddr_un.
+	maxSocketPathLen = 103
 )
 
 type sessionMeta struct {
@@ -87,7 +93,10 @@ func runD(args []string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	sock := uniqueSocketPath(dir, labelFor(args))
+	sock, err := uniqueSocketPath(dir, labelFor(args))
+	if err != nil {
+		return err
+	}
 	if err := writeSessionMeta(sock, args); err != nil {
 		return err
 	}
@@ -95,7 +104,7 @@ func runD(args []string) error {
 		_ = os.Remove(metaPath(sock))
 		return err
 	}
-	if err := waitSocket(sock, 2*time.Second); err != nil {
+	if err := waitSocket(sock, serverStartWait); err != nil {
 		_ = os.Remove(metaPath(sock))
 		return err
 	}
@@ -315,20 +324,38 @@ func labelFor(args []string) string {
 	return label
 }
 
-func uniqueSocketPath(dir, base string) string {
+func uniqueSocketPath(dir, base string) (string, error) {
 	if base == "" {
 		base = "session"
 	}
-	for i := 0; ; i++ {
-		name := fmt.Sprintf("%s-%d-%d", base, time.Now().UnixNano(), os.Getpid())
+	for i := 0; i < 100; i++ {
+		suffix := fmt.Sprintf("-%s-%d", strconv.FormatInt(time.Now().UnixNano(), 36), os.Getpid())
 		if i > 0 {
-			name = fmt.Sprintf("%s-%d-%d-%d", base, time.Now().UnixNano(), os.Getpid(), i)
+			suffix += fmt.Sprintf("-%d", i)
 		}
-		path := filepath.Join(dir, name+".sock")
-		if !isSocket(path) {
-			return path
+		candidateBase := base
+		path := filepath.Join(dir, candidateBase+suffix+".sock")
+		if excess := len(path) - maxSocketPathLen; excess > 0 {
+			keep := len(candidateBase) - excess
+			if keep < 1 {
+				return "", fmt.Errorf("d: session directory is too long for a Unix socket: %s", dir)
+			}
+			candidateBase = strings.TrimRight(candidateBase[:keep], "-")
+			if candidateBase == "" {
+				candidateBase = "s"
+			}
+			path = filepath.Join(dir, candidateBase+suffix+".sock")
+		}
+		if len(path) > maxSocketPathLen {
+			return "", fmt.Errorf("d: session directory is too long for a Unix socket: %s", dir)
+		}
+		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+			return path, nil
+		} else if err != nil {
+			return "", err
 		}
 	}
+	return "", errors.New("d: could not allocate a unique session socket")
 }
 
 func metaPath(sock string) string {
@@ -520,38 +547,76 @@ func runServer(args []string) error {
 	}
 	_ = slave.Close()
 
-	server := &ptyServer{master: master, clients: map[net.Conn]struct{}{}}
-	go server.broadcastPTY()
+	server := &ptyServer{
+		master:      master,
+		clients:     map[net.Conn]struct{}{},
+		clientReady: make(chan struct{}),
+	}
+	ptyDone := make(chan struct{})
+	go func() {
+		server.broadcastPTY()
+		close(ptyDone)
+	}()
 	go func() {
 		_ = cmd.Wait()
+	}()
+	go func() {
+		<-ptyDone
+		select {
+		case <-server.clientReady:
+		case <-time.After(initialAttachWait):
+		}
+		server.shutdownClients()
 		_ = ln.Close()
-		_ = master.Close()
 	}()
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
+			server.shutdownClients()
+			server.clientWG.Wait()
 			return nil
 		}
-		server.add(conn)
-		go server.handle(conn)
+		if !server.add(conn) {
+			continue
+		}
+		go func() {
+			defer server.clientWG.Done()
+			server.handle(conn)
+		}()
 	}
 }
 
 type ptyServer struct {
-	mu      sync.Mutex
-	master  *os.File
-	clients map[net.Conn]struct{}
-	history []byte
+	mu          sync.Mutex
+	master      *os.File
+	clients     map[net.Conn]struct{}
+	history     []byte
+	readyOnce   sync.Once
+	clientReady chan struct{}
+	clientWG    sync.WaitGroup
+	closing     bool
 }
 
-func (s *ptyServer) add(conn net.Conn) {
+func (s *ptyServer) markClientReady() {
+	s.readyOnce.Do(func() {
+		close(s.clientReady)
+	})
+}
+
+func (s *ptyServer) add(conn net.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closing {
+		_ = conn.Close()
+		return false
+	}
+	s.clientWG.Add(1)
 	s.clients[conn] = struct{}{}
 	if len(s.history) > 0 {
 		_, _ = conn.Write(s.history)
 	}
+	return true
 }
 
 func (s *ptyServer) remove(conn net.Conn) {
@@ -564,6 +629,17 @@ func (s *ptyServer) remove(conn net.Conn) {
 func (s *ptyServer) closeClients() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.closeClientsLocked()
+}
+
+func (s *ptyServer) shutdownClients() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closing = true
+	s.closeClientsLocked()
+}
+
+func (s *ptyServer) closeClientsLocked() {
 	for conn := range s.clients {
 		_ = conn.Close()
 		delete(s.clients, conn)
@@ -586,7 +662,6 @@ func (s *ptyServer) broadcastPTY() {
 			s.mu.Unlock()
 		}
 		if err != nil {
-			s.closeClients()
 			return
 		}
 	}
@@ -607,6 +682,7 @@ func (s *ptyServer) handle(conn net.Conn) {
 		if err != nil {
 			return
 		}
+		s.markClientReady()
 		switch typ {
 		case frameInput:
 			_, _ = s.master.Write(payload)
