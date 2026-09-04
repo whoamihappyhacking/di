@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/hinshun/vt10x"
 	"golang.org/x/term"
 )
 
@@ -49,7 +50,9 @@ func main() {
 		fmt.Print(helpText())
 		return
 	}
-	if len(os.Args) > 1 && os.Args[1] == "--server" {
+	if len(os.Args) > 1 && os.Args[1] == "--preview" {
+		err = previewSession(os.Args[2:])
+	} else if len(os.Args) > 1 && os.Args[1] == "--server" {
 		err = runServer(os.Args[2:])
 	} else if len(os.Args) > 1 && os.Args[1] == "install" {
 		err = installSelf()
@@ -137,7 +140,9 @@ Environment:
   D_DETACH=^B                 override the detach key
 
 Notes:
-  di requires fzf to pick sessions. Starting and listing sessions do not.
+  di requires fzf to pick sessions. The picker renders the latest terminal screen
+  for previews, including full-screen agent applications.
+  Starting and listing sessions do not require fzf.
 `
 }
 
@@ -212,11 +217,13 @@ func pickAndAttach() error {
 	if len(sessions) == 0 {
 		return errors.New("di: no sessions found")
 	}
+	width, height := terminalSize()
 	lines := make([]string, 0, len(sessions))
 	for _, session := range sessions {
-		lines = append(lines, session.displayLine())
+		lines = append(lines, session.displayLine(width))
 	}
-	cmd := exec.Command("fzf", "--prompt=di> ", "--height=40%", "--reverse", "--delimiter=\t", "--with-nth=2..")
+	cmdArgs := fzfArgs(os.Args[0], height)
+	cmd := exec.Command("fzf", cmdArgs...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -240,6 +247,118 @@ func pickAndAttach() error {
 	return attach(fields[0])
 }
 
+func fzfArgs(executable string, height int) []string {
+	preview := fmt.Sprintf("%s --preview {1}", shellQuote(executable))
+	if height <= 0 {
+		height = 24
+	}
+	previewHeight := height - 6
+	if previewHeight < 1 {
+		previewHeight = 1
+	}
+	return []string{
+		"--prompt=di> ",
+		"--height=100%",
+		"--reverse",
+		"--no-hscroll",
+		"--delimiter=\t",
+		"--with-nth=2..",
+		"--preview=" + preview,
+		fmt.Sprintf("--preview-window=down,%d,wrap,border-top", previewHeight),
+	}
+}
+
+func terminalSize() (int, int) {
+	width, height, err := term.GetSize(0)
+	if err != nil {
+		return 0, 0
+	}
+	return width, height
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func previewSession(args []string) error {
+	if len(args) != 1 || args[0] == "" {
+		return nil
+	}
+
+	output, err := sessionPreviewOutput(args[0])
+	if err != nil {
+		return nil
+	}
+	cols, rows := previewSize()
+	_, err = os.Stdout.Write(renderPreview(output, cols, rows))
+	return err
+}
+
+func previewSize() (int, int) {
+	return positiveEnvInt("FZF_PREVIEW_COLUMNS", 120), positiveEnvInt("FZF_PREVIEW_LINES", 40)
+}
+
+func positiveEnvInt(name string, fallback int) int {
+	value, err := strconv.Atoi(os.Getenv(name))
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func renderPreview(output []byte, cols, rows int) []byte {
+	if len(output) == 0 {
+		return nil
+	}
+	terminal := vt10x.New(vt10x.WithSize(cols, rows))
+	if _, err := terminal.Write(output); err != nil {
+		return nil
+	}
+
+	lines := strings.Split(terminal.String(), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for i := range lines {
+		lines[i] = strings.TrimRight(lines[i], " ")
+	}
+	for len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(lines, "\n") + "\n")
+}
+
+func sessionPreviewOutput(sock string) ([]byte, error) {
+	conn, err := dialSession(sock)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	// The server keeps the socket open after replaying history. A short read
+	// deadline lets fzf refresh previews without waiting for the session.
+	if err := conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		return nil, err
+	}
+	var output []byte
+	buf := make([]byte, 4096)
+	for {
+		n, readErr := conn.Read(buf)
+		if n > 0 {
+			output = append(output, buf[:n]...)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrDeadlineExceeded) || errors.Is(readErr, syscall.EAGAIN) || errors.Is(readErr, io.EOF) {
+				return output, nil
+			}
+			return output, readErr
+		}
+	}
+}
+
 func sessionDir() (string, error) {
 	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
 		return filepath.Join(xdg, "di"), nil
@@ -256,7 +375,7 @@ type sessionInfo struct {
 	Meta sessionMeta
 }
 
-func (s sessionInfo) displayLine() string {
+func (s sessionInfo) displayLine(width int) string {
 	name := s.Meta.Name
 	if name == "" {
 		name = strings.TrimSuffix(filepath.Base(s.Sock), ".sock")
@@ -269,7 +388,50 @@ func (s sessionInfo) displayLine() string {
 	if cmd == "" {
 		cmd = name
 	}
-	return fmt.Sprintf("%s\t%-56s\t%-56s\t%s", s.Sock, pwd, cmd, name)
+
+	if width <= 0 {
+		width = 120
+	}
+	available := width - 8
+	if available < 48 {
+		available = 48
+	}
+	pwdWidth := clampInt(available*3/10, 18, 32)
+	nameWidth := clampInt(available/5, 16, 28)
+	cmdWidth := available - pwdWidth - nameWidth - 2
+	if cmdWidth < 20 {
+		cmdWidth = 20
+	}
+	return fmt.Sprintf("%s\t%-*s\t%-*s\t%-*s",
+		s.Sock,
+		pwdWidth, fitField(pwd, pwdWidth),
+		cmdWidth, fitField(cmd, cmdWidth),
+		nameWidth, fitField(name, nameWidth),
+	)
+}
+
+func clampInt(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func fitField(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width <= 3 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-3]) + "..."
 }
 
 func allSessions() ([]sessionInfo, error) {
