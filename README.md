@@ -1,5 +1,7 @@
 # di
 
+[项目主页](https://whoamihappyhacking.github.io/di/)
+
 `di` 是一个可断开、可重新进入的终端会话工具。它用 Go 自己管理 PTY 和 Unix socket，不依赖 `dtach`。
 
 ## 依赖
@@ -93,3 +95,15 @@ GOOS=darwin GOARCH=amd64 go build -o di-darwin-amd64 .
 ## 说明
 
 `di` 解决的是“终端断开后重新进入”的问题，不是 checkpoint 工具；它不会保存进程内存、文件系统快照或网络连接状态。
+
+## 项目介绍网页
+
+在线访问：[di 项目介绍页](https://whoamihappyhacking.github.io/di/)。推送 `website/` 更新到 `main` 后，GitHub Actions 会自动部署到 GitHub Pages。
+
+本地介绍页位于 `website/`，包含断开、会话预览和重新连接的浏览器交互演示。演示不执行真实终端命令。
+
+```sh
+python3 -m http.server 7789 --bind 0.0.0.0 --directory website
+```
+
+启动后访问 <http://localhost:7789/>。

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#101311">
+<meta name="description" content="di：可断开、可重新进入的终端会话。用 d 启动，用 Ctrl-] 离开，用 di 回到现场。Go 原生管理 PTY 与 Unix socket，支持 Linux 和 macOS。">
+<title>di — 离开终端，留住现场。</title><link rel="icon" href="favicon.svg" type="image/svg+xml"><link rel="preload" href="fonts/wenkai-medium.woff" as="font" type="font/woff" crossorigin><link rel="preload" href="fonts/wenkai-regular.woff" as="font" type="font/woff" crossorigin><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="typography.css?v=3"><script src="app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">跳转到正文</a>
+<header class="header shell"><a class="logo" href="#" aria-label="di 首页">d<span>i</span><b>_</b></a><nav aria-label="主导航"><a href="#playground">交互演示</a><a href="#features">工作方式</a><a href="#install">安装</a></nav><a class="github" href="https://github.com/whoamihappyhacking/di" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.86c-2.78.61-3.37-1.18-3.37-1.18-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.64-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03a9.6 9.6 0 0 1 5 0c1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85v2.75c0 .26.18.57.69.48A10 10 0 0 0 12 2Z"/></svg><span>GitHub</span><span>↗</span></a></header>
+<main id="main">
+<section class="hero shell">
+<div class="eyebrow"><span class="signal-dot"></span> SMALL TOOL. UNINTERRUPTED FLOW.</div>
+<h1>离开终端，<br><em>留住现场。</em></h1>
+<p class="hero-lead">长任务还在跑，你可以先走。<br>用 <code>d</code> 开始，用 <code>di</code> 回来。接上原来的会话，继续刚才的事。</p>
+<div class="hero-actions"><a class="button mint" href="#install">安装 di <span>↗</span></a><a class="button ghost" href="#playground">体验断开与重连 <span>↓</span></a></div>
+<div class="compat"><span>⌁ &nbsp;Linux</span><span>⌘ &nbsp;macOS</span><span>Go 1.25+</span><span>不依赖 dtach</span></div>
+<div class="hero-coordinate" aria-hidden="true">SESSION / PERSIST<br>CONNECTION / OPTIONAL</div>
+</section>
+<section class="playground shell" id="playground" aria-label="终端会话交互演示" tabindex="0">
+<div class="demo-overline"><span><span class="signal-dot"></span> 一个会话，随时进出。</span><span>INTERACTIVE DEMO <b>浏览器模拟 · 不执行命令</b></span></div>
+<div class="terminal">
+<div class="terminal-title"><div class="window-dots"><i></i><i></i><i></i></div><span id="window-title">~/projects/api-server — go test ./...</span><span class="session-tag">SESSION 01</span></div>
+<div class="terminal-layout">
+<aside class="session-sidebar"><div class="sidebar-heading">YOUR SESSIONS <span>03</span></div><div role="group" aria-label="演示会话列表" class="session-list">
+<button class="session-item selected" data-session="0" aria-pressed="true"><span class="session-line"><span class="session-indicator"></span>api-server <small>01</small></span><code>go test ./...</code><span class="session-path">~/projects/api-server</span></button>
+<button class="session-item" data-session="1" aria-pressed="false"><span class="session-line"><span class="session-indicator"></span>my-agent <small>02</small></span><code>codex</code><span class="session-path">~/projects/di</span></button>
+<button class="session-item" data-session="2" aria-pressed="false"><span class="session-line"><span class="session-indicator"></span>dev-server <small>03</small></span><code>npm run dev</code><span class="session-path">~/projects/website</span></button>
+</div><div class="sidebar-footer"><span class="signal-dot"></span> 后台会话仍在运行</div></aside>
+<div class="terminal-main">
+<div class="terminal-location"><span id="terminal-directory">~/projects/api-server</span><span id="connection-badge">ATTACHED</span></div>
+<div id="attached-view"><div class="command-line"><span>❯</span> <span id="terminal-command">d go test ./...</span></div><div class="terminal-output" id="terminal-output"><p class="dim"># 持续运行的工作，不必一直守着。</p><p><span class="green">ok</span> &nbsp; api-server/internal/config &nbsp;<span class="dim">0.012s</span></p><p><span class="green">ok</span> &nbsp; api-server/internal/store &nbsp; <span class="dim">0.084s</span></p><p><span class="green">ok</span> &nbsp; api-server/internal/router &nbsp;<span class="dim">0.031s</span></p><br><p><span class="amber">RUN</span> &nbsp;integration tests...</p></div><div class="progress-row"><span class="progress-track"><i id="task-progress"></i></span><span id="task-percent">38%</span></div><div class="terminal-cursor" aria-hidden="true">▌</div></div>
+<div id="detached-view" hidden><div class="command-line"><span>❯</span> <span>Ctrl-]</span></div><div class="detach-message"><span class="detached-icon">⇥</span><h2>已离开，任务继续。</h2><p>断开的是连接，不是后台进程。<br>去做别的事，准备好了再回来。</p><span class="background-status"><i class="signal-dot"></i> 后台运行中 · <span id="background-progress">38%</span></span></div></div>
+<div id="picker-view" hidden><div class="command-line"><span>❯</span> di <span class="picker-caption">选择一个会话，看看它运行到了哪里。</span></div><div class="preview-header"><span>LATEST FRAME / <b id="preview-name">api-server</b></span><span>终端画面预览</span></div><pre id="preview-content">$ go test ./...
+ok  api-server/internal/config
+ok  api-server/internal/store
+RUN integration tests...</pre><div class="picker-hint">← 点击左侧会话切换预览 <span>Enter ↵ 重新连接</span></div></div>
+<div class="terminal-bottom"><span id="terminal-hint">试着断开连接，看看会发生什么。</span><kbd id="key-hint">Ctrl + ]</kbd></div>
+</div>
+</div>
+<div class="demo-toolbar"><div class="mode-steps"><span class="active" data-step="attached"><b>01</b> 运行</span><i>→</i><span data-step="detached"><b>02</b> 断开</span><i>→</i><span data-step="picking"><b>03</b> 回来</span></div><div class="demo-buttons"><button id="reset-demo" aria-label="重置交互演示">↺</button><button id="demo-action">断开连接 <kbd>Ctrl-]</kbd></button></div></div>
+</div>
+<div class="demo-footnote" role="status" id="demo-announcement">点击“断开连接”体验。演示区域内也可以按 Ctrl-]。</div>
+</section>
+<section class="statement shell"><span class="section-id">01 — PHILOSOPHY</span><h2>你的工作，不该绑在<br>一个终端窗口上。</h2><p>Agent 在思考，测试在运行，服务在等待请求。<br>di 在后台维持会话，让你可以断开，再从另一个终端回来。</p></section>
+<section class="features shell" id="features">
+<article class="feature-card"><div class="feature-symbol">d<span>_</span></div><div class="feature-heading"><span>START</span><h3>照常启动，多一层从容。</h3></div><p>在命令前加一个 <code>d</code>，就得到一个可断开的会话。相同目录、相同命令重复运行，也会创建独立会话。</p><div class="inline-command"><span>❯</span><code>d &lt;command&gt; [args...]</code></div></article>
+<article class="feature-card"><div class="feature-symbol"><span>^</span>]</div><div class="feature-heading"><span>DETACH</span><h3>离开现场，不中断工作。</h3></div><p><code>Ctrl-]</code> 断开当前客户端，后端命令继续运行。也可以从另一个终端断开指定会话的客户端。</p><div class="inline-command"><span>❯</span><code>d --detach &lt;name&gt;</code></div></article>
+<article class="feature-card"><div class="feature-symbol">d<span>i</span></div><div class="feature-heading"><span>REATTACH</span><h3>看一眼，再接回去。</h3></div><p>输入 <code>di</code>，用 fzf 选择会话。目录、命令与最新终端画面一起呈现，选对那个你想继续的现场。</p><div class="inline-command"><span>❯</span><code>di</code><span class="command-note">选择 → 预览 → Enter</span></div></article>
+</section>
+<section class="details shell"><div class="detail-heading"><span class="section-id">02 — THE SMALL THINGS</span><h2>小工具，<br>把细节做好。</h2><a href="https://github.com/whoamihappyhacking/di#readme" target="_blank" rel="noopener noreferrer">读一读项目文档 ↗</a></div><div class="detail-grid"><article><span class="detail-icon">▤</span><h3>看最后一帧，不看控制序列</h3><p>解析全屏终端程序的重绘，预览呈现最近画面。Agent 界面也能清楚地看。</p></article><article><span class="detail-icon">↕</span><h3>把滚轮留给历史输出</h3><p>鼠标滚轮不转发给后端程序，直接用终端自己的滚屏查看历史。</p></article><article><span class="detail-icon">⌘</span><h3>快捷键，按你的习惯来</h3><p>通过 <code>D_DETACH='^B'</code> 临时调整断开快捷键，用起来更顺手。</p></article><article><span class="detail-icon">◇</span><h3>Go 实现，少一层依赖</h3><p>自己管理 PTY 与 Unix socket，不依赖 dtach。启动和列出会话也不需要 fzf。</p></article></div></section>
+<section class="install-section" id="install"><div class="shell install-inner"><div class="install-copy"><span class="section-id">03 — GET STARTED</span><h2>下一次长任务，<br>带上 <span>di。</span></h2><p>支持 Linux 和 macOS。<br>准备好 Go 与 fzf，构建后即可安装。</p><div class="requirements"><span><i>✓</i> Go 1.25 或更高版本</span><span><i>✓</i> fzf：用于选择已有会话</span><span><i>✓</i> ~/.local/bin 已加入 PATH</span></div><a class="repo-link" href="https://github.com/whoamihappyhacking/di" target="_blank" rel="noopener noreferrer">github.com/whoamihappyhacking/di ↗</a></div><div class="install-terminal"><div class="install-title"><span><span class="signal-dot"></span> BUILD / INSTALL</span><button class="copy" data-copy="install-code">复制命令 <span>⧉</span></button></div><pre><code id="install-code">git clone https://github.com/whoamihappyhacking/di.git
+cd di
+go build -o di .
+./di install</code></pre><div class="install-result"><span>INSTALLED</span><code>~/.local/bin/d<br>~/.local/bin/di → d</code></div><div class="install-tip">先安装 fzf；不安装也可以用 <code>d</code> 启动和列出会话。</div></div></div></section>
+<section class="cheatsheet shell"><div class="cheatsheet-heading"><h2>几个命令，就够了。</h2><span>KEEP IT CLOSE</span></div><div class="command-grid"><button class="command-copy" data-command="d --list"><span>列出会话</span><code>d --list</code><b>⧉</b></button><button class="command-copy" data-command="di"><span>回到会话</span><code>di</code><b>⧉</b></button><button class="command-copy" data-command="d --help"><span>查看帮助</span><code>d --help</code><b>⧉</b></button></div><p class="scope-note"><span>关于“留住现场”</span>di 保持的是运行中的终端会话，不是进程快照。它不会保存进程内存、文件系统或网络连接状态，也不能在机器重启或进程退出后恢复任务。</p><div id="copy-status" class="copy-status" role="status"></div></section>
+</main>
+<footer class="footer shell"><a class="logo" href="#">d<span>i</span><b>_</b></a><span>DISCONNECT THE TERMINAL. NOT THE FLOW.</span><a href="https://github.com/whoamihappyhacking/di/issues" target="_blank" rel="noopener noreferrer">交流与反馈 ↗</a></footer>
+</body>
+</html>

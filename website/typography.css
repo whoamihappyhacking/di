@@ -1,0 +1,163 @@
+@font-face {
+  font-family: 'LXGW WenKai Web';
+  src: url('fonts/wenkai-regular.woff') format('woff');
+  font-weight: 400;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'LXGW WenKai Web';
+  src: url('fonts/wenkai-medium.woff') format('woff');
+  font-weight: 500 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'di Mono';
+  src: url('fonts/terminal-mono.woff') format('woff');
+  font-weight: 400 900;
+  font-display: swap;
+}
+:root {
+  --sans: 'LXGW WenKai Web', 'LXGW WenKai', cursive;
+  --mono: 'di Mono', 'LXGW WenKai Web', monospace;
+  --display: 'LXGW WenKai Web', 'LXGW WenKai', cursive;
+}
+body { font-synthesis: none; text-rendering: optimizeLegibility; }
+.logo { font-weight: 400; letter-spacing: -.09em; }
+.header nav { font-size: 13px; }
+.github { font-size: 12px; }
+.hero h1 {
+  font-family: var(--display);
+  font-size: clamp(60px, 5.8vw, 82px);
+  font-weight: 500;
+  line-height: 1.35;
+  letter-spacing: -.045em;
+  margin-block: 25px 24px;
+}
+.hero-lead { font-size: 16px; line-height: 1.95; color: #9eac94; }
+.hero-lead code { font-size: 15px; }
+.button { font-size: 13px; font-weight: 500; }
+.eyebrow { font-size: 10px; letter-spacing: .13em; }
+.compat { font-size: 10px; }
+.hero-coordinate { font-size: 8px; }
+.demo-overline { font-size: 12px; }
+.demo-overline>span:last-child, .demo-overline b { font-size: 9px; }
+.terminal-title { font-size: 10px; }
+.session-tag, .sidebar-heading { font-size: 9px; }
+.session-line { font-size: 12px; }
+.session-item>code { font-size: 10px; }
+.session-path { font-size: 9px; }
+.sidebar-footer { font-size: 10px; }
+.terminal-location { font-size: 10px; }
+.terminal-location>span:last-child { font-size: 9px; }
+.command-line { font-size: 14px; }
+.terminal-output { font-size: 12px; line-height: 1.85; }
+.terminal-output p { margin-block: 7px; }
+.terminal-main { min-height: 415px; }
+.terminal-bottom { font-size: 10px; }
+.terminal-bottom kbd { font-size: 9px; }
+.mode-steps { font-size: 11px; }
+.mode-steps b { font-size: 9px; }
+#demo-action { font-size: 12px; }
+#demo-action kbd { font-size: 10px; }
+.demo-footnote { font-size: 11px; color: #7f9472; }
+.detach-message h2 { font-family: var(--display); font-size: 27px; font-weight: 500; }
+.detach-message p { font-size: 13px; }
+.background-status { font-size: 11px; }
+.picker-caption, .preview-header, .preview-header>span:last-child { font-size: 10px; }
+#preview-content { font-size: 12px; }
+.picker-hint { font-size: 10px; }
+.section-id { font-size: 10px; letter-spacing: .12em; }
+.statement h2, .detail-heading h2, .install-copy h2 {
+  font-family: var(--display);
+  font-weight: 500;
+  letter-spacing: -.03em;
+}
+.statement h2 { font-size: 39px; }
+.statement p { font-size: 15px; color: #99aa8e; }
+.feature-heading h3 { font-size: 18px; font-weight: 500; }
+.feature-heading>span { font-size: 10px; }
+.feature-card p { font-size: 13px; line-height: 1.9; }
+.feature-card p code { font-size: 12px; }
+.inline-command { font-size: 11px; }
+.inline-command .command-note { font-size: 9px; }
+.detail-heading h2 { font-size: 37px; }
+.detail-heading a { font-size: 13px; }
+.detail-grid h3 { font-size: 15px; font-weight: 500; }
+.detail-grid p { font-size: 13px; line-height: 1.9; }
+.detail-grid code { font-size: 11px; }
+.install-copy h2 { font-size: 42px; }
+.install-copy>p { font-size: 14px; }
+.requirements>span { font-size: 12px; }
+.repo-link { font-size: 10px; }
+.install-title { font-size: 10px; }
+.copy { font-size: 11px; }
+.install-terminal pre { font-size: 11px; line-height: 2.3; }
+.install-result>span { font-size: 9px; }
+.install-result>code { font-size: 12px; }
+.install-tip { font-size: 11px; }
+.cheatsheet-heading h2 { font-weight: 500; }
+.cheatsheet-heading>span { font-size: 9px; }
+.command-copy>span { font-size: 11px; }
+.command-copy code { font-size: 13px; }
+.scope-note { font-size: 12px; color: #7e9172; }
+.copy-status { font-size: 12px; }
+.footer>span { font-size: 9px; }
+.footer>a:last-child { font-size: 12px; }
+@media (max-width: 1000px) {
+  .terminal-output { font-size: 10px; }
+  .command-line { font-size: 12px; }
+  .session-line { font-size: 11px; }
+  .session-item>code { font-size: 9px; }
+  .session-path { font-size: 8px; }
+  .install-terminal pre { font-size: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+}
+@media (max-width: 720px) {
+  .header nav { font-size: 11px; gap: 17px; }
+  .github { font-size: 10px; }
+  .hero h1 { font-size: 57px; line-height: 1.4; letter-spacing: -.035em; }
+  .eyebrow { font-size: 8px; letter-spacing: .08em; }
+  .hero-lead { font-size: 13px; line-height: 2; max-width: 345px; margin-inline: auto; }
+  .hero-lead code { font-size: 12px; }
+  .hero-actions { margin-top: 25px; }
+  .button { font-size: 12px; gap: 14px; }
+  .compat { font-size: 9px; }
+  .compat span { padding-inline: 8px; }
+  .demo-overline { font-size: 10px; }
+  .demo-overline>span:last-child, .demo-overline b { font-size: 8px; }
+  .terminal-title { font-size: 8px; }
+  .session-line { font-size: 9px; }
+  .session-item>code { font-size: 8px; }
+  .terminal-location { font-size: 9px; }
+  .terminal-location>span:last-child { font-size: 8px; }
+  .terminal-main { min-height: 390px; }
+  .terminal-output { font-size: 9px; }
+  .terminal-bottom { font-size: 8px; }
+  .terminal-bottom kbd { font-size: 8px; }
+  .mode-steps { font-size: 9px; gap: 6px; }
+  #demo-action { font-size: 10px; min-width: 115px; gap: 8px; }
+  #demo-action kbd { font-size: 8px; }
+  .demo-footnote { font-size: 10px; }
+  .picker-caption, .preview-header, .preview-header>span:last-child { font-size: 8px; }
+  #preview-content { font-size: 10px; }
+  .picker-hint { font-size: 8px; }
+  .detach-message p { font-size: 12px; }
+  .statement h2 { font-size: 29px; }
+  .statement p { font-size: 13px; }
+  .section-id { font-size: 9px; }
+  .feature-heading h3 { font-size: 18px; }
+  .detail-heading h2 { font-size: 31px; }
+  .detail-grid h3 { font-size: 14px; }
+  .detail-grid p { font-size: 12px; }
+  .install-copy h2 { font-size: 36px; }
+  .install-terminal pre { font-size: 10px; }
+  .requirements>span { font-size: 12px; }
+  .repo-link { font-size: 9px; }
+  .scope-note { font-size: 11px; }
+  .footer>span { font-size: 8px; letter-spacing: .06em; }
+}
+@media (max-width: 370px) {
+  .hero h1 { font-size: 49px; }
+  .header nav { font-size: 10px; }
+  .hero-lead { font-size: 12px; }
+  .mode-steps { font-size: 8px; }
+}
