@@ -2,7 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -92,6 +95,7 @@ func runD(args []string) error {
 		}
 		return detachSession(filepath.Join(dir, args[1]+".sock"))
 	}
+	args = expandCommandAlias(args)
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -112,6 +116,241 @@ func runD(args []string) error {
 		return err
 	}
 	return attach(sock)
+}
+
+func expandCommandAlias(args []string) []string {
+	aliases := loadShellAliases()
+	return expandAliasArgs(args, aliases)
+}
+
+func expandAliasArgs(args []string, aliases map[string]string) []string {
+	if len(args) == 0 || len(aliases) == 0 {
+		return args
+	}
+	value, ok := aliases[args[0]]
+	if !ok || value == "" {
+		return args
+	}
+	words := splitAliasWords(value)
+	if len(words) == 0 {
+		return args
+	}
+	return append(words, args[1:]...)
+}
+
+type cachedAliases struct {
+	Key     string            `json:"key"`
+	Aliases map[string]string `json:"aliases"`
+}
+
+var (
+	aliasOnce sync.Once
+	aliasMap  map[string]string
+)
+
+func loadShellAliases() map[string]string {
+	aliasOnce.Do(func() { aliasMap = loadAliasesFromCache() })
+	return aliasMap
+}
+
+func loadAliasesFromCache() map[string]string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		return nil
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return queryShellAliases(shell)
+	}
+	return loadAliasesFrom(shell, filepath.Join(dir, "di", "aliases.json"))
+}
+
+func loadAliasesFrom(shell, cacheFile string) map[string]string {
+	key := aliasCacheKey(shell)
+	if data, err := os.ReadFile(cacheFile); err == nil {
+		var cached cachedAliases
+		if json.Unmarshal(data, &cached) == nil && cached.Key == key {
+			return cached.Aliases
+		}
+	}
+	aliases := queryShellAliases(shell)
+	if aliases == nil {
+		return nil
+	}
+	data, err := json.Marshal(cachedAliases{Key: key, Aliases: aliases})
+	if err != nil {
+		return aliases
+	}
+	if os.MkdirAll(filepath.Dir(cacheFile), 0o700) == nil {
+		writeAliasCache(cacheFile, data)
+	}
+	return aliases
+}
+
+func writeAliasCache(cacheFile string, data []byte) {
+	tmp, err := os.CreateTemp(filepath.Dir(cacheFile), "aliases-*.tmp")
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(tmp.Name(), cacheFile)
+}
+
+func aliasCacheKey(shell string) string {
+	home, _ := os.UserHomeDir()
+	var files []string
+	switch filepath.Base(shell) {
+	case "zsh":
+		if zd := os.Getenv("ZDOTDIR"); zd != "" {
+			files = []string{filepath.Join(zd, ".zshenv"), filepath.Join(zd, ".zprofile"), filepath.Join(zd, ".zshrc"), filepath.Join(zd, ".zlogin")}
+		} else {
+			files = []string{filepath.Join(home, ".zshenv"), filepath.Join(home, ".zprofile"), filepath.Join(home, ".zshrc"), filepath.Join(home, ".zlogin")}
+		}
+	case "bash":
+		files = []string{"/etc/bash.bashrc", filepath.Join(home, ".bashrc"), filepath.Join(home, ".profile")}
+	}
+	h := sha256.New()
+	h.Write([]byte(shell))
+	for _, f := range files {
+		if info, err := os.Stat(f); err == nil {
+			fmt.Fprintf(h, "\x00%s:%d:%d", f, info.ModTime().UnixNano(), info.Size())
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func queryShellAliases(shell string) map[string]string {
+	if shell == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := shellAliasCmd(ctx, shell).Output()
+	if err != nil {
+		return nil
+	}
+	return parseAliasOutput(out)
+}
+
+func shellAliasCmd(ctx context.Context, shell string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, shell, "-ic", "alias")
+	cmd.Stdin = strings.NewReader("")
+	cmd.Stderr = io.Discard
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd
+}
+
+func parseAliasOutput(out []byte) map[string]string {
+	aliases := map[string]string{}
+	for rawLine := range strings.SplitSeq(string(out), "\n") {
+		line := strings.TrimSpace(strings.TrimSuffix(rawLine, "\r"))
+		line = strings.TrimPrefix(line, "alias ")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(line[:eq])
+		if name == "" || strings.ContainsAny(name, " \t") {
+			continue
+		}
+		aliases[name] = unquoteAliasValue(strings.TrimSpace(line[eq+1:]))
+	}
+	return aliases
+}
+
+func unquoteAliasValue(value string) string {
+	if value == "" {
+		return ""
+	}
+	switch value[0] {
+	case '\'':
+		if len(value) < 2 || value[len(value)-1] != '\'' {
+			return value
+		}
+		return strings.ReplaceAll(value[1:len(value)-1], `'\''`, `'`)
+	case '"':
+		if len(value) < 2 || value[len(value)-1] != '"' {
+			return value
+		}
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			return unquoted
+		}
+		return value[1 : len(value)-1]
+	default:
+		return value
+	}
+}
+
+func splitAliasWords(value string) []string {
+	var words []string
+	var cur strings.Builder
+	inWord := false
+	for i := 0; i < len(value); {
+		switch value[i] {
+		case ' ', '\t', '\n':
+			if inWord {
+				words = append(words, cur.String())
+				cur.Reset()
+				inWord = false
+			}
+			i++
+		case '\'':
+			inWord = true
+			i++
+			for i < len(value) && value[i] != '\'' {
+				cur.WriteByte(value[i])
+				i++
+			}
+			if i < len(value) {
+				i++
+			}
+		case '"':
+			inWord = true
+			i++
+			for i < len(value) && value[i] != '"' {
+				c := value[i]
+				if c == '\\' && i+1 < len(value) {
+					i++
+					c = value[i]
+				}
+				cur.WriteByte(c)
+				i++
+			}
+			if i < len(value) {
+				i++
+			}
+		case '\\':
+			inWord = true
+			if i+1 < len(value) {
+				i++
+				cur.WriteByte(value[i])
+			}
+			i++
+		default:
+			inWord = true
+			cur.WriteByte(value[i])
+			i++
+		}
+	}
+	if inWord {
+		words = append(words, cur.String())
+	}
+	return words
 }
 
 func usage() string {
@@ -140,6 +379,9 @@ Environment:
   D_DETACH=^B                 override the detach key
 
 Notes:
+  d expands the first command token using shell aliases ($SHELL -ic alias);
+  extra arguments are appended after the expansion, so d app -x runs app -f
+  /etc/app.conf -x for an alias app='app -f /etc/app.conf'.
   di requires fzf to pick sessions. The picker renders the latest terminal screen
   for previews, including full-screen agent applications.
   Starting and listing sessions do not require fzf.
@@ -252,10 +494,7 @@ func fzfArgs(executable string, height int) []string {
 	if height <= 0 {
 		height = 24
 	}
-	previewHeight := height - 6
-	if previewHeight < 1 {
-		previewHeight = 1
-	}
+	previewHeight := max(height-6, 1)
 	return []string{
 		"--prompt=di> ",
 		"--height=100%",
@@ -402,7 +641,8 @@ func (s sessionInfo) displayLine(width int) string {
 	if cmdWidth < 20 {
 		cmdWidth = 20
 	}
-	return fmt.Sprintf("%s\t%-*s\t%-*s\t%-*s",
+	return fmt.Sprintf(
+		"%s\t%-*s\t%-*s\t%-*s",
 		s.Sock,
 		pwdWidth, fitField(pwd, pwdWidth),
 		cmdWidth, fitField(cmd, cmdWidth),

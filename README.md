@@ -48,6 +48,13 @@ di --help
 d codex --yolo
 ```
 
+命令名会按当前 shell（`$SHELL`）的别名展开，只展开第一个词，后续参数追加在展开之后：
+
+```sh
+d app          # alias app='app -f /etc/app.conf' → 实际执行 app -f /etc/app.conf
+d app -x       # → app -f /etc/app.conf -x
+```
+
 断开 attach，后端命令继续运行：
 
 ```text
