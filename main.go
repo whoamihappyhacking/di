@@ -255,7 +255,7 @@ func parseAliasOutput(out []byte) map[string]string {
 	aliases := map[string]string{}
 	for rawLine := range strings.SplitSeq(string(out), "\n") {
 		line := strings.TrimSpace(strings.TrimSuffix(rawLine, "\r"))
-		line = strings.TrimPrefix(line, "alias ")
+		line = strings.TrimPrefix(line, "alias ") // bash
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

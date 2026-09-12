@@ -48,7 +48,7 @@ di --help
 d codex --yolo
 ```
 
-命令名会按当前 shell（`$SHELL`）的别名展开，只展开第一个词，后续参数追加在展开之后：
+命令名会按当前 shell（`$SHELL`）的别名展开，只展开第一个词，后续参数追加在展开之后, 目前支持**bash**与**zsh**：
 
 ```sh
 d app          # alias app='app -f /etc/app.conf' → 实际执行 app -f /etc/app.conf
@@ -102,6 +102,7 @@ GOOS=darwin GOARCH=amd64 go build -o di-darwin-amd64 .
 ## 说明
 
 `di` 解决的是“终端断开后重新进入”的问题，不是 checkpoint 工具；它不会保存进程内存、文件系统快照或网络连接状态。
+由于不同的用户的shell环境不同，获取alias列表的快慢不同，所以会在`~/.cache/di/`下产生一个json文件以缓存别名，当bash或zsh的配置文件更改之后下次执行di会重新生成新的缓存。
 
 ## 项目介绍网页
 
@@ -113,4 +114,5 @@ GOOS=darwin GOARCH=amd64 go build -o di-darwin-amd64 .
 python3 -m http.server 7789 --bind 0.0.0.0 --directory website
 ```
 
-启动后访问 <http://localhost:7789/>。
+启动后访问 <http://localhost:7789/>
+=======
