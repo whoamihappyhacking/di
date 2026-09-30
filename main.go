@@ -3,9 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -95,7 +93,7 @@ func runD(args []string) error {
 		}
 		return detachSession(filepath.Join(dir, args[1]+".sock"))
 	}
-	args = expandCommandAlias(args)
+	commandArgs := expandCommandAlias(args)
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -107,7 +105,7 @@ func runD(args []string) error {
 	if err := writeSessionMeta(sock, args); err != nil {
 		return err
 	}
-	if err := startServer(sock, args); err != nil {
+	if err := startServer(sock, commandArgs); err != nil {
 		_ = os.Remove(metaPath(sock))
 		return err
 	}
@@ -119,119 +117,29 @@ func runD(args []string) error {
 }
 
 func expandCommandAlias(args []string) []string {
-	aliases := loadShellAliases()
-	return expandAliasArgs(args, aliases)
+	shell := os.Getenv("SHELL")
+	return expandAliasArgs(args, queryShellAliases(shell), shell)
 }
 
-func expandAliasArgs(args []string, aliases map[string]string) []string {
-	if len(args) == 0 || len(aliases) == 0 {
+func expandAliasArgs(args []string, aliases map[string]string, shell string) []string {
+	if len(args) == 0 || shell == "" {
 		return args
 	}
 	value, ok := aliases[args[0]]
 	if !ok || value == "" {
 		return args
 	}
-	words := splitAliasWords(value)
-	if len(words) == 0 {
-		return args
-	}
-	return append(words, args[1:]...)
-}
-
-type cachedAliases struct {
-	Key     string            `json:"key"`
-	Aliases map[string]string `json:"aliases"`
-}
-
-var (
-	aliasOnce sync.Once
-	aliasMap  map[string]string
-)
-
-func loadShellAliases() map[string]string {
-	aliasOnce.Do(func() { aliasMap = loadAliasesFromCache() })
-	return aliasMap
-}
-
-func loadAliasesFromCache() map[string]string {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		return nil
-	}
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return queryShellAliases(shell)
-	}
-	return loadAliasesFrom(shell, filepath.Join(dir, "di", "aliases.json"))
-}
-
-func loadAliasesFrom(shell, cacheFile string) map[string]string {
-	key := aliasCacheKey(shell)
-	if data, err := os.ReadFile(cacheFile); err == nil {
-		var cached cachedAliases
-		if json.Unmarshal(data, &cached) == nil && cached.Key == key {
-			return cached.Aliases
-		}
-	}
-	aliases := queryShellAliases(shell)
-	if aliases == nil {
-		return nil
-	}
-	data, err := json.Marshal(cachedAliases{Key: key, Aliases: aliases})
-	if err != nil {
-		return aliases
-	}
-	if os.MkdirAll(filepath.Dir(cacheFile), 0o700) == nil {
-		writeAliasCache(cacheFile, data)
-	}
-	return aliases
-}
-
-func writeAliasCache(cacheFile string, data []byte) {
-	tmp, err := os.CreateTemp(filepath.Dir(cacheFile), "aliases-*.tmp")
-	if err != nil {
-		return
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		return
-	}
-	_ = os.Rename(tmp.Name(), cacheFile)
-}
-
-func aliasCacheKey(shell string) string {
-	home, _ := os.UserHomeDir()
-	var files []string
-	switch filepath.Base(shell) {
-	case "zsh":
-		if zd := os.Getenv("ZDOTDIR"); zd != "" {
-			files = []string{filepath.Join(zd, ".zshenv"), filepath.Join(zd, ".zprofile"), filepath.Join(zd, ".zshrc"), filepath.Join(zd, ".zlogin")}
-		} else {
-			files = []string{filepath.Join(home, ".zshenv"), filepath.Join(home, ".zprofile"), filepath.Join(home, ".zshrc"), filepath.Join(home, ".zlogin")}
-		}
-	case "bash":
-		files = []string{"/etc/bash.bashrc", filepath.Join(home, ".bashrc"), filepath.Join(home, ".profile")}
-	}
-	h := sha256.New()
-	h.Write([]byte(shell))
-	for _, f := range files {
-		if info, err := os.Stat(f); err == nil {
-			fmt.Fprintf(h, "\x00%s:%d:%d", f, info.ModTime().UnixNano(), info.Size())
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	// Let the shell interpret assignments, quoting, and other aliases. Remove
+	// the requested alias first so its expansion is not applied a second time.
+	// Positional parameters keep user arguments literal, even with shell syntax.
+	script := "unalias -- " + shellQuote(args[0]) + "\n" + value + ` "$@"`
+	return append([]string{shell, "-ic", script, "d"}, args[1:]...)
 }
 
 func queryShellAliases(shell string) map[string]string {
-	if shell == "" {
+	switch filepath.Base(shell) {
+	case "bash", "zsh":
+	default:
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -296,63 +204,6 @@ func unquoteAliasValue(value string) string {
 	}
 }
 
-func splitAliasWords(value string) []string {
-	var words []string
-	var cur strings.Builder
-	inWord := false
-	for i := 0; i < len(value); {
-		switch value[i] {
-		case ' ', '\t', '\n':
-			if inWord {
-				words = append(words, cur.String())
-				cur.Reset()
-				inWord = false
-			}
-			i++
-		case '\'':
-			inWord = true
-			i++
-			for i < len(value) && value[i] != '\'' {
-				cur.WriteByte(value[i])
-				i++
-			}
-			if i < len(value) {
-				i++
-			}
-		case '"':
-			inWord = true
-			i++
-			for i < len(value) && value[i] != '"' {
-				c := value[i]
-				if c == '\\' && i+1 < len(value) {
-					i++
-					c = value[i]
-				}
-				cur.WriteByte(c)
-				i++
-			}
-			if i < len(value) {
-				i++
-			}
-		case '\\':
-			inWord = true
-			if i+1 < len(value) {
-				i++
-				cur.WriteByte(value[i])
-			}
-			i++
-		default:
-			inWord = true
-			cur.WriteByte(value[i])
-			i++
-		}
-	}
-	if inWord {
-		words = append(words, cur.String())
-	}
-	return words
-}
-
 func usage() string {
 	return "usage: d <command> [args...]\n       d install\n       d --list\n       d --detach <name>"
 }
@@ -379,9 +230,9 @@ Environment:
   D_DETACH=^B                 override the detach key
 
 Notes:
-  d expands the first command token using shell aliases ($SHELL -ic alias);
-  extra arguments are appended after the expansion, so d app -x runs app -f
-  /etc/app.conf -x for an alias app='app -f /etc/app.conf'.
+  d reads bash/zsh aliases from $SHELL startup files for each new session.
+  Alias commands run in that shell; additional arguments stay literal.
+  Aliases defined only in the current terminal must be saved in startup files.
   di requires fzf to pick sessions. The picker renders the latest terminal screen
   for previews, including full-screen agent applications.
   Starting and listing sessions do not require fzf.

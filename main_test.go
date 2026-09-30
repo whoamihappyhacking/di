@@ -191,54 +191,6 @@ func TestSessionDisplayLineKeepsSocketAndMetadataOrder(t *testing.T) {
 	}
 }
 
-func TestExpandAliasArgs(t *testing.T) {
-	aliases := map[string]string{"app": "app -f /etc/app.conf"}
-	want := []string{"app", "-f", "/etc/app.conf", "-x"}
-	got := expandAliasArgs([]string{"app", "-x"}, aliases)
-	if len(got) != len(want) {
-		t.Fatalf("expanded %q, want %q", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("expanded %q, want %q", got, want)
-		}
-	}
-	unchanged := expandAliasArgs([]string{"vim", "x"}, aliases)
-	if len(unchanged) != 2 || unchanged[0] != "vim" {
-		t.Fatalf("unknown command should be unchanged: %q", unchanged)
-	}
-	empty := expandAliasArgs(nil, aliases)
-	if len(empty) != 0 {
-		t.Fatalf("empty args should stay empty: %q", empty)
-	}
-}
-
-func TestExpandAliasArgsAppendsAfterValue(t *testing.T) {
-	aliases := map[string]string{"app": "app -f /etc/app.conf"}
-	want := []string{"app", "-f", "/etc/app.conf", "extra1", "extra2"}
-	got := expandAliasArgs([]string{"app", "extra1", "extra2"}, aliases)
-	if len(got) != len(want) {
-		t.Fatalf("expanded %q, want %q", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("expanded %q, want %q", got, want)
-		}
-	}
-}
-
-func TestSplitAliasWords(t *testing.T) {
-	words := splitAliasWords(`cd '/path/with space'`)
-	want := []string{"cd", "/path/with space"}
-	if len(words) != len(want) || words[0] != want[0] || words[1] != want[1] {
-		t.Fatalf("split %q, want %q", words, want)
-	}
-	one := splitAliasWords("realapp")
-	if len(one) != 1 || one[0] != "realapp" {
-		t.Fatalf("split %q", one)
-	}
-}
-
 func TestParseAliasOutputBashAndZshFormats(t *testing.T) {
 	out := []byte("alias app='app -f /etc/app.conf'\nalias ls='ls --color=auto'\nll='ls -l'\nnot an alias line\n")
 	m := parseAliasOutput(out)
@@ -276,73 +228,6 @@ func TestUnquoteAliasValue(t *testing.T) {
 	}
 	if got := unquoteAliasValue("plain"); got != "plain" {
 		t.Fatalf("unquoted value = %q", got)
-	}
-}
-
-func TestQueryShellAliasesRunsShell(t *testing.T) {
-	script := filepath.Join(t.TempDir(), "shell")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf \"alias app='app -f /etc/app.conf'\\n\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	m := queryShellAliases(script)
-	if m["app"] != "app -f /etc/app.conf" {
-		t.Fatalf("aliases = %v", m)
-	}
-}
-
-func TestLoadAliasesFromCachesAndSkipsShell(t *testing.T) {
-	shell := filepath.Join(t.TempDir(), "shell")
-	if err := os.WriteFile(shell, []byte("#!/bin/sh\nprintf \"alias app='app -f /etc/app.conf'\\n\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cacheFile := filepath.Join(t.TempDir(), "aliases.json")
-	first := loadAliasesFrom(shell, cacheFile)
-	if first["app"] != "app -f /etc/app.conf" {
-		t.Fatalf("first load aliases = %v", first)
-	}
-	_ = os.Remove(shell)
-	second := loadAliasesFrom(shell, cacheFile)
-	if second["app"] != "app -f /etc/app.conf" {
-		t.Fatalf("cached load aliases = %v", second)
-	}
-	if _, err := os.Stat(cacheFile); err != nil {
-		t.Fatalf("cache file missing: %v", err)
-	}
-}
-
-func TestLoadAliasesFromRefetchesOnStaleKey(t *testing.T) {
-	shell := filepath.Join(t.TempDir(), "shell")
-	if err := os.WriteFile(shell, []byte("#!/bin/sh\nprintf \"alias app='app -f /etc/app.conf'\\n\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cacheFile := filepath.Join(t.TempDir(), "aliases.json")
-	if err := os.WriteFile(cacheFile, []byte(`{"key":"stale","aliases":{"app":"old"}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got := loadAliasesFrom(shell, cacheFile); got["app"] != "app -f /etc/app.conf" {
-		t.Fatalf("stale key should refetch: %v", got)
-	}
-}
-
-func TestAliasCacheKeyTracksRcMtime(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	rc := filepath.Join(home, ".bashrc")
-	if err := os.WriteFile(rc, []byte("alias a=b\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	before := aliasCacheKey("/bin/bash")
-	time.Sleep(10 * time.Millisecond)
-	beforeAgain := aliasCacheKey("/bin/bash")
-	if before != beforeAgain {
-		t.Fatalf("key must be stable while rc is unchanged: %s / %s", before, beforeAgain)
-	}
-	if err := os.WriteFile(rc, []byte("alias a='b c'\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	after := aliasCacheKey("/bin/bash")
-	if after == before {
-		t.Fatal("key must change when the rc file changes")
 	}
 }
 
