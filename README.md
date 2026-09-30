@@ -48,6 +48,13 @@ di --help
 d codex --yolo
 ```
 
+命令名支持 `$SHELL` 启动配置中的 **bash** 和 **zsh** 别名，后续参数会按原样传给命令：
+
+```sh
+d app          # alias app='app -f /etc/app.conf' → 实际执行 app -f /etc/app.conf
+d app -x       # → app -f /etc/app.conf -x
+```
+
 断开 attach，后端命令继续运行：
 
 ```text
@@ -95,6 +102,7 @@ GOOS=darwin GOARCH=amd64 go build -o di-darwin-amd64 .
 ## 说明
 
 `di` 解决的是“终端断开后重新进入”的问题，不是 checkpoint 工具；它不会保存进程内存、文件系统快照或网络连接状态。
+每次启动新会话都会重新读取 shell 别名，修改被 `source` 的文件或插件后，下次启动即可生效。读取速度取决于 shell 启动配置；别名探测最多等待约 5 秒。别名会交给对应的 shell 执行，支持环境变量赋值、引号、嵌套别名和管道，额外参数中的空格或 `$()` 等内容不会被重新解释。仅在当前终端临时定义的别名需要先写入 shell 启动配置。
 
 ## 项目介绍网页
 

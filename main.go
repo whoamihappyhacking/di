@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -92,6 +93,7 @@ func runD(args []string) error {
 		}
 		return detachSession(filepath.Join(dir, args[1]+".sock"))
 	}
+	commandArgs := expandCommandAlias(args)
 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -103,7 +105,7 @@ func runD(args []string) error {
 	if err := writeSessionMeta(sock, args); err != nil {
 		return err
 	}
-	if err := startServer(sock, args); err != nil {
+	if err := startServer(sock, commandArgs); err != nil {
 		_ = os.Remove(metaPath(sock))
 		return err
 	}
@@ -112,6 +114,94 @@ func runD(args []string) error {
 		return err
 	}
 	return attach(sock)
+}
+
+func expandCommandAlias(args []string) []string {
+	shell := os.Getenv("SHELL")
+	return expandAliasArgs(args, queryShellAliases(shell), shell)
+}
+
+func expandAliasArgs(args []string, aliases map[string]string, shell string) []string {
+	if len(args) == 0 || shell == "" {
+		return args
+	}
+	value, ok := aliases[args[0]]
+	if !ok || value == "" {
+		return args
+	}
+	// Let the shell interpret assignments, quoting, and other aliases. Remove
+	// the requested alias first so its expansion is not applied a second time.
+	// Positional parameters keep user arguments literal, even with shell syntax.
+	script := "unalias -- " + shellQuote(args[0]) + "\n" + value + ` "$@"`
+	return append([]string{shell, "-ic", script, "d"}, args[1:]...)
+}
+
+func queryShellAliases(shell string) map[string]string {
+	switch filepath.Base(shell) {
+	case "bash", "zsh":
+	default:
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := shellAliasCmd(ctx, shell).Output()
+	if err != nil {
+		return nil
+	}
+	return parseAliasOutput(out)
+}
+
+func shellAliasCmd(ctx context.Context, shell string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, shell, "-ic", "alias")
+	cmd.Stdin = strings.NewReader("")
+	cmd.Stderr = io.Discard
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd
+}
+
+func parseAliasOutput(out []byte) map[string]string {
+	aliases := map[string]string{}
+	for rawLine := range strings.SplitSeq(string(out), "\n") {
+		line := strings.TrimSpace(strings.TrimSuffix(rawLine, "\r"))
+		line = strings.TrimPrefix(line, "alias ") // bash
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(line[:eq])
+		if name == "" || strings.ContainsAny(name, " \t") {
+			continue
+		}
+		aliases[name] = unquoteAliasValue(strings.TrimSpace(line[eq+1:]))
+	}
+	return aliases
+}
+
+func unquoteAliasValue(value string) string {
+	if value == "" {
+		return ""
+	}
+	switch value[0] {
+	case '\'':
+		if len(value) < 2 || value[len(value)-1] != '\'' {
+			return value
+		}
+		return strings.ReplaceAll(value[1:len(value)-1], `'\''`, `'`)
+	case '"':
+		if len(value) < 2 || value[len(value)-1] != '"' {
+			return value
+		}
+		if unquoted, err := strconv.Unquote(value); err == nil {
+			return unquoted
+		}
+		return value[1 : len(value)-1]
+	default:
+		return value
+	}
 }
 
 func usage() string {
@@ -140,6 +230,9 @@ Environment:
   D_DETACH=^B                 override the detach key
 
 Notes:
+  d reads bash/zsh aliases from $SHELL startup files for each new session.
+  Alias commands run in that shell; additional arguments stay literal.
+  Aliases defined only in the current terminal must be saved in startup files.
   di requires fzf to pick sessions. The picker renders the latest terminal screen
   for previews, including full-screen agent applications.
   Starting and listing sessions do not require fzf.
@@ -252,10 +345,7 @@ func fzfArgs(executable string, height int) []string {
 	if height <= 0 {
 		height = 24
 	}
-	previewHeight := height - 6
-	if previewHeight < 1 {
-		previewHeight = 1
-	}
+	previewHeight := max(height-6, 1)
 	return []string{
 		"--prompt=di> ",
 		"--height=100%",
@@ -402,7 +492,8 @@ func (s sessionInfo) displayLine(width int) string {
 	if cmdWidth < 20 {
 		cmdWidth = 20
 	}
-	return fmt.Sprintf("%s\t%-*s\t%-*s\t%-*s",
+	return fmt.Sprintf(
+		"%s\t%-*s\t%-*s\t%-*s",
 		s.Sock,
 		pwdWidth, fitField(pwd, pwdWidth),
 		cmdWidth, fitField(cmd, cmdWidth),

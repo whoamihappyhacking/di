@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -187,6 +188,53 @@ func TestSessionDisplayLineKeepsSocketAndMetadataOrder(t *testing.T) {
 	}}).displayLine(100)
 	if !strings.HasPrefix(line, "/tmp/session.sock\t/work") {
 		t.Fatalf("display line = %q, want socket and directory first", line)
+	}
+}
+
+func TestParseAliasOutputBashAndZshFormats(t *testing.T) {
+	out := []byte("alias app='app -f /etc/app.conf'\nalias ls='ls --color=auto'\nll='ls -l'\nnot an alias line\n")
+	m := parseAliasOutput(out)
+	if m["app"] != "app -f /etc/app.conf" {
+		t.Fatalf("app = %q", m["app"])
+	}
+	if m["ls"] != "ls --color=auto" {
+		t.Fatalf("ls = %q", m["ls"])
+	}
+	if m["ll"] != "ls -l" {
+		t.Fatalf("ll = %q", m["ll"])
+	}
+	if _, ok := m["not"]; ok {
+		t.Fatal("non-alias line parsed as an alias")
+	}
+}
+
+func TestParseAliasOutputSkipsNoise(t *testing.T) {
+	out := []byte("\x1b[37C \x1b[1G banner\nsome random line\nx y = z\n")
+	m := parseAliasOutput(out)
+	if len(m) != 0 {
+		t.Fatalf("noise parsed as aliases: %v", m)
+	}
+}
+
+func TestUnquoteAliasValue(t *testing.T) {
+	if got := unquoteAliasValue(`'app -f /etc/app.conf'`); got != "app -f /etc/app.conf" {
+		t.Fatalf("single-quoted value = %q", got)
+	}
+	if got := unquoteAliasValue(`"a \"quoted\" word"`); got != `a "quoted" word` {
+		t.Fatalf("double-quoted value = %q", got)
+	}
+	if got := unquoteAliasValue(`'plain'\''quoted'`); got != "plain'quoted" {
+		t.Fatalf("embedded quote value = %q", got)
+	}
+	if got := unquoteAliasValue("plain"); got != "plain" {
+		t.Fatalf("unquoted value = %q", got)
+	}
+}
+
+func TestShellAliasCmdDetachesFromTerminal(t *testing.T) {
+	syscalls := shellAliasCmd(context.Background(), "/bin/sh").SysProcAttr
+	if syscalls == nil || !syscalls.Setsid {
+		t.Fatal("alias query must run in its own session to avoid SIGTTOU suspension")
 	}
 }
 
