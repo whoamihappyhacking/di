@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 	"github.com/hinshun/vt10x"
@@ -27,6 +29,7 @@ import (
 
 const (
 	defaultDetachKey = "^]"
+	defaultSwitchKey = `^\`
 	frameInput       = 'i'
 	frameResize      = 'w'
 	frameDetachAll   = 'D'
@@ -225,9 +228,11 @@ Usage:
 
 Keys:
   Ctrl-]                      detach from the current session
+  Ctrl-\                      switch to another session with fzf
 
 Environment:
   D_DETACH=^B                 override the detach key
+  D_SWITCH=^\                 override the session switch key
 
 Notes:
   d reads bash/zsh aliases from $SHELL startup files for each new session.
@@ -300,16 +305,25 @@ func installSelf() error {
 }
 
 func pickAndAttach() error {
+	selected, err := pickSession("")
+	if err != nil || selected == "" {
+		return err
+	}
+	return attachSession(selected, true)
+}
+
+func pickSession(currentSock string) (string, error) {
 	if _, err := exec.LookPath("fzf"); err != nil {
-		return errors.New("di: fzf is not installed")
+		return "", errors.New("di: fzf is not installed")
 	}
 	sessions, err := allSessions()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if len(sessions) == 0 {
-		return errors.New("di: no sessions found")
+		return "", errors.New("di: no sessions found")
 	}
+	sessions = orderAndEnrichSessions(sessions, currentSock)
 	width, height := terminalSize()
 	lines := make([]string, 0, len(sessions))
 	for _, session := range sessions {
@@ -317,27 +331,28 @@ func pickAndAttach() error {
 	}
 	cmdArgs := fzfArgs(os.Args[0], height)
 	cmd := exec.Command("fzf", cmdArgs...)
+	cmd.Stderr = os.Stderr
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return err
+		return "", err
 	}
 	go copyLines(stdin, lines)
 	out, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 130 {
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
 	selected := strings.TrimSpace(string(out))
 	if selected == "" {
-		return nil
+		return "", nil
 	}
 	fields := strings.Split(selected, "\t")
 	if len(fields) == 0 || fields[0] == "" {
-		return nil
+		return "", nil
 	}
-	return attach(fields[0])
+	return fields[0], nil
 }
 
 func fzfArgs(executable string, height int) []string {
@@ -345,9 +360,12 @@ func fzfArgs(executable string, height int) []string {
 	if height <= 0 {
 		height = 24
 	}
-	previewHeight := max(height-6, 1)
+	listRows := clampInt(height*2/5, 8, 16)
+	previewHeight := max(height-listRows-2, 6)
 	return []string{
 		"--prompt=di> ",
+		"--header=Enter: 切换  Ctrl-\\: 下一个  Esc: 返回",
+		"--bind=ctrl-\\:down",
 		"--height=100%",
 		"--reverse",
 		"--no-hscroll",
@@ -400,25 +418,255 @@ func renderPreview(output []byte, cols, rows int) []byte {
 	if len(output) == 0 {
 		return nil
 	}
-	terminal := vt10x.New(vt10x.WithSize(cols, rows))
+	if cols <= 0 {
+		cols = 80
+	}
+	if rows <= 0 {
+		rows = 24
+	}
+	const maxPreviewBytes = 64 << 10
+	if len(output) > maxPreviewBytes {
+		output = trimHistorySlice(output[len(output)-maxPreviewBytes:])
+	}
+	output = normalizeForVT10x(output)
+	// Replay into a virtual terminal using the session's native rendered width
+	// and a tall row count so relative cursor-up redraws (\r\x1b[<N>A) do not
+	// wrap out of sync or scroll conversation text off the top of the screen.
+	vtCols := detectNativeCols(output, cols)
+	vtRows := max(rows*4, 120)
+	terminal := vt10x.New(vt10x.WithSize(vtCols, vtRows))
 	if _, err := terminal.Write(output); err != nil {
 		return nil
 	}
 
-	lines := strings.Split(terminal.String(), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-	for i := range lines {
-		lines[i] = strings.TrimRight(lines[i], " ")
-	}
-	for len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
-	if len(lines) == 0 {
+	rawLines := strings.Split(terminal.String(), "\n")
+	cleaned := cleanRenderedLines(rawLines, cols)
+	if len(cleaned) == 0 {
 		return nil
 	}
-	return []byte(strings.Join(lines, "\n") + "\n")
+	if len(cleaned) > rows {
+		cleaned = cleaned[len(cleaned)-rows:]
+	}
+	return []byte(strings.Join(cleaned, "\n") + "\n")
+}
+
+// normalizeForVT10x adapts modern TUI differential rendering sequences (such
+// as Claude Code's Ink CHA \x1b[<col>G space-skipping and \x1b[H\x1b[2K screen
+// clears) for vt10x, which uses 1 cell per rune regardless of CJK display width.
+func normalizeForVT10x(output []byte) []byte {
+	// If the output contains an Ink full-screen clear (\x1b[H\x1b[2K\x1b[1B\x1b[2K),
+	// discard stale frames prior to the last clear and replace with \x1b[2J\x1b[H.
+	inkClear := []byte("\x1b[H\x1b[2K\x1b[1B\x1b[2K")
+	if idx := bytes.LastIndex(output, inkClear); idx >= 0 {
+		rest := output[idx:]
+		// Skip the entire run of \x1b[H / \x1b[2K / \x1b[1B clear commands.
+		j := 0
+		for j < len(rest) {
+			if bytes.HasPrefix(rest[j:], []byte("\x1b[H")) {
+				j += 3
+			} else if bytes.HasPrefix(rest[j:], []byte("\x1b[2K")) || bytes.HasPrefix(rest[j:], []byte("\x1b[1B")) {
+				j += 4
+			} else {
+				break
+			}
+		}
+		output = append([]byte(clearScreenHome), rest[j:]...)
+	}
+
+	var out bytes.Buffer
+	out.Grow(len(output))
+	col := 1
+	for i := 0; i < len(output); {
+		b := output[i]
+		if b == '\r' || b == '\n' {
+			col = 1
+			out.WriteByte(b)
+			i++
+			continue
+		}
+		if b == 0x1b && i+1 < len(output) {
+			if output[i+1] == '[' {
+				j := i + 2
+				for j < len(output) && (output[j] < 0x40 || output[j] > 0x7e) {
+					j++
+				}
+				if j < len(output) {
+					final := output[j]
+					params := output[i+2 : j]
+					if final == 'G' {
+						targetCol, err := strconv.Atoi(string(params))
+						if err == nil && targetCol >= 1 {
+							if targetCol >= col {
+								spaces := targetCol - col
+								if spaces > 0 {
+									out.WriteString(strings.Repeat(" ", spaces))
+								}
+								col = targetCol
+								i = j + 1
+								continue
+							}
+						}
+					} else if final == 'H' || final == 'f' || final == 'J' || final == 'K' {
+						col = 1
+					} else if final == 'C' {
+						n, err := strconv.Atoi(string(params))
+						if err != nil || n <= 0 {
+							n = 1
+						}
+						col += n
+					}
+					out.Write(output[i : j+1])
+					i = j + 1
+					continue
+				}
+			} else if output[i+1] == ']' {
+				// OSC sequence ending with BEL (0x07) or ST (\x1b\\).
+				j := i + 2
+				for j < len(output) {
+					if output[j] == 0x07 {
+						j++
+						break
+					}
+					if output[j] == 0x1b && j+1 < len(output) && output[j+1] == '\\' {
+						j += 2
+						break
+					}
+					j++
+				}
+				out.Write(output[i:j])
+				i = j
+				continue
+			}
+		}
+		r, size := utf8.DecodeRune(output[i:])
+		if r == utf8.RuneError && size == 1 {
+			out.WriteByte(output[i])
+			i++
+			continue
+		}
+		if r >= 0x20 {
+			col += singleRuneWidth(r)
+		}
+		out.Write(output[i : i+size])
+		i += size
+	}
+	return out.Bytes()
+}
+
+// detectNativeCols infers the PTY column width at which the latest screen in
+// output was rendered by checking the most recent horizontal rule (──────).
+func detectNativeCols(output []byte, fallback int) int {
+	lines := bytes.Split(output, []byte("\n"))
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := bytes.TrimRight(lines[i], "\r ")
+		w := countHorizontalRuleWidth(line)
+		if w >= 30 && w <= 300 {
+			return w
+		}
+	}
+	return fallback
+}
+
+func countHorizontalRuleWidth(line []byte) int {
+	// Strip simple CSI sequences before checking if the line is a horizontal rule.
+	var plain []rune
+	for i := 0; i < len(line); {
+		if line[i] == 0x1b && i+1 < len(line) && line[i+1] == '[' {
+			i += 2
+			for i < len(line) && (line[i] < 0x40 || line[i] > 0x7e) {
+				i++
+			}
+			if i < len(line) {
+				i++
+			}
+			continue
+		}
+		r, size := utf8.DecodeRune(line[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++
+			continue
+		}
+		plain = append(plain, r)
+		i += size
+	}
+	if len(plain) < 30 {
+		return 0
+	}
+	ruleChars := 0
+	for _, r := range plain {
+		if r == '─' || r == '━' || r == '═' {
+			ruleChars++
+		}
+	}
+	if ruleChars*10 >= len(plain)*9 {
+		return len(plain)
+	}
+	return 0
+}
+
+func cleanRenderedLines(rawLines []string, targetCols int) []string {
+	var collapsed []string
+	blankRun := 0
+	for _, line := range rawLines {
+		trimmed := strings.TrimRight(line, " ")
+		if trimmed == "" {
+			blankRun++
+			if len(collapsed) > 0 && blankRun <= 1 {
+				collapsed = append(collapsed, "")
+			}
+			continue
+		}
+		blankRun = 0
+		if isPureHorizontalRule(trimmed) {
+			ruleLen := min(targetCols, runeDisplayWidth(trimmed))
+			if ruleLen < 8 {
+				ruleLen = 8
+			}
+			collapsed = append(collapsed, strings.Repeat("─", ruleLen))
+			continue
+		}
+		collapsed = append(collapsed, wrapDisplayLine(trimmed, targetCols)...)
+	}
+	for len(collapsed) > 0 && collapsed[len(collapsed)-1] == "" {
+		collapsed = collapsed[:len(collapsed)-1]
+	}
+	return collapsed
+}
+
+func isPureHorizontalRule(s string) bool {
+	runes := []rune(strings.TrimSpace(s))
+	if len(runes) < 20 {
+		return false
+	}
+	for _, r := range runes {
+		if r != '─' && r != '━' && r != '═' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func wrapDisplayLine(s string, maxCols int) []string {
+	if maxCols <= 0 || runeDisplayWidth(s) <= maxCols {
+		return []string{s}
+	}
+	var out []string
+	var cur strings.Builder
+	curW := 0
+	for _, r := range s {
+		rw := singleRuneWidth(r)
+		if curW+rw > maxCols && curW > 0 {
+			out = append(out, strings.TrimRight(cur.String(), " "))
+			cur.Reset()
+			curW = 0
+		}
+		cur.WriteRune(r)
+		curW += rw
+	}
+	if cur.Len() > 0 {
+		out = append(out, strings.TrimRight(cur.String(), " "))
+	}
+	return out
 }
 
 func sessionPreviewOutput(sock string) ([]byte, error) {
@@ -428,17 +676,23 @@ func sessionPreviewOutput(sock string) ([]byte, error) {
 	}
 	defer conn.Close()
 
-	// The server keeps the socket open after replaying history. A short read
-	// deadline lets fzf refresh previews without waiting for the session.
+	// The server replays history immediately upon accept. Once the first chunk
+	// arrives, use a short 5ms drain deadline so fzf previews and session list
+	// summaries return almost instantaneously.
 	if err := conn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
 		return nil, err
 	}
 	var output []byte
-	buf := make([]byte, 4096)
+	buf := make([]byte, 32<<10)
+	shortenedDeadline := false
 	for {
 		n, readErr := conn.Read(buf)
 		if n > 0 {
 			output = append(output, buf[:n]...)
+			if !shortenedDeadline {
+				shortenedDeadline = true
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Millisecond))
+			}
 		}
 		if readErr != nil {
 			if errors.Is(readErr, os.ErrDeadlineExceeded) || errors.Is(readErr, syscall.EAGAIN) || errors.Is(readErr, io.EOF) {
@@ -461,22 +715,172 @@ func sessionDir() (string, error) {
 }
 
 type sessionInfo struct {
-	Sock string
-	Meta sessionMeta
+	Sock    string
+	Meta    sessionMeta
+	Status  string
+	Summary string
+	Current bool
+}
+
+func orderAndEnrichSessions(sessions []sessionInfo, currentSock string) []sessionInfo {
+	var wg sync.WaitGroup
+	for i := range sessions {
+		if currentSock != "" && sessions[i].Sock == currentSock {
+			sessions[i].Current = true
+		}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			output, err := sessionPreviewOutput(sessions[idx].Sock)
+			if err != nil || len(output) == 0 {
+				sessions[idx].Status = "○"
+				return
+			}
+			status, summary := extractSessionSummary(output)
+			sessions[idx].Status = status
+			sessions[idx].Summary = summary
+		}(i)
+	}
+	wg.Wait()
+
+	// When invoked from inside an active session via Ctrl-\, place other sessions
+	// first so pressing Enter or Ctrl-\ immediately switches to another session.
+	if currentSock != "" && len(sessions) > 1 {
+		others := make([]sessionInfo, 0, len(sessions))
+		var current []sessionInfo
+		for _, s := range sessions {
+			if s.Current {
+				current = append(current, s)
+			} else {
+				others = append(others, s)
+			}
+		}
+		sessions = append(others, current...)
+	}
+	return sessions
+}
+
+func extractSessionSummary(output []byte) (status string, summary string) {
+	const maxInspectBytes = 64 << 10
+	if len(output) > maxInspectBytes {
+		output = trimHistorySlice(output[len(output)-maxInspectBytes:])
+	}
+	status = "○"
+	lastWorking := bytes.LastIndex(output, []byte("\x1b]7501;state=working\x07"))
+	lastDone := max(
+		bytes.LastIndex(output, []byte("\x1b]7501;state=done\x07")),
+		bytes.LastIndex(output, []byte("\x1b]7501;state=idle\x07")),
+	)
+	if lastWorking > lastDone {
+		status = "●"
+	}
+
+	output = normalizeForVT10x(output)
+	vtCols := detectNativeCols(output, 100)
+	terminal := vt10x.New(vt10x.WithSize(vtCols, 120))
+	if _, err := terminal.Write(output); err != nil {
+		return status, ""
+	}
+	rawLines := strings.Split(terminal.String(), "\n")
+	var activeTool string
+	var substantive []string
+	for i := len(rawLines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(rawLines[i])
+		if line == "" || isPureHorizontalRule(line) {
+			continue
+		}
+		if spinnerText, ok := parseSpinnerLine(line); ok {
+			status = "●"
+			if activeTool == "" && spinnerText != "" {
+				activeTool = spinnerText
+			}
+			continue
+		}
+		if isUIChromeLine(line) {
+			continue
+		}
+		cleaned := cleanSummaryText(line)
+		if cleaned == "" {
+			continue
+		}
+		substantive = append([]string{cleaned}, substantive...)
+		if len(substantive) >= 2 || runeDisplayWidth(strings.Join(substantive, " ")) >= 56 {
+			break
+		}
+	}
+	summary = strings.Join(substantive, " ")
+	if activeTool != "" {
+		if summary != "" {
+			summary = "[" + activeTool + "] " + summary
+		} else {
+			summary = "[" + activeTool + "]"
+		}
+	}
+	return status, summary
+}
+
+func parseSpinnerLine(line string) (string, bool) {
+	r, size := utf8.DecodeRuneInString(line)
+	if r >= 0x2800 && r <= 0x28ff {
+		return strings.TrimSpace(line[size:]), true
+	}
+	return "", false
+}
+
+func isUIChromeLine(line string) bool {
+	if line == ">" || line == "❯" || line == "$" || line == "#" || line == "↳" {
+		return true
+	}
+	if strings.HasPrefix(line, "? for shortcuts") ||
+		strings.HasPrefix(line, "esc to cancel") ||
+		strings.HasPrefix(line, "Argon ·") ||
+		strings.HasPrefix(line, "8 Flash ·") ||
+		strings.HasPrefix(line, "Flash ·") ||
+		strings.HasPrefix(line, "Pro ·") ||
+		strings.HasPrefix(line, "Gemini ") ||
+		strings.HasPrefix(line, "GPT-") ||
+		strings.HasPrefix(line, "Claude ") ||
+		strings.HasPrefix(line, "└ Tip:") ||
+		strings.HasPrefix(line, "⚡ ") ||
+		strings.HasPrefix(line, "✻ ") ||
+		strings.HasPrefix(line, "⏵⏵") ||
+		strings.HasPrefix(line, "cache in:") ||
+		strings.HasPrefix(line, "Reloaded keybindings") ||
+		strings.Contains(line, "for shortcuts") ||
+		strings.Contains(line, "shift+tab to") ||
+		strings.Contains(line, "esc to interrupt") ||
+		strings.Contains(line, "Esc to cancel") ||
+		strings.Contains(line, "ctrl+o to expand") ||
+		strings.Contains(line, "ctrl+c to") ||
+		strings.Contains(line, "MCP:") ||
+		strings.Contains(line, "think:high") ||
+		strings.Contains(line, "think:medium") {
+		return true
+	}
+	// Box drawing borders without text content.
+	onlyBorder := true
+	for _, r := range line {
+		if r != '─' && r != '━' && r != '│' && r != '╭' && r != '╮' && r != '╯' && r != '╰' && r != ' ' && r != '>' && r != '❯' {
+			onlyBorder = false
+			break
+		}
+	}
+	return onlyBorder
+}
+
+func cleanSummaryText(line string) string {
+	line = strings.TrimLeft(line, "•*-│╭╰> ")
+	line = strings.TrimRight(line, "│╮╯` ")
+	return strings.Join(strings.Fields(line), " ")
 }
 
 func (s sessionInfo) displayLine(width int) string {
-	name := s.Meta.Name
-	if name == "" {
-		name = strings.TrimSuffix(filepath.Base(s.Sock), ".sock")
-	}
-	pwd := s.Meta.PWD
-	if pwd == "" {
-		pwd = "-"
-	}
-	cmd := strings.Join(s.Meta.Command, " ")
-	if cmd == "" {
-		cmd = name
+	name := cleanSessionName(s.Meta.Name, s.Sock)
+	pwd := formatDisplayPWD(s.Meta.PWD, s.Status, s.Current)
+	cmd := formatDisplayCommand(s.Meta.Command, name)
+	summary := s.Summary
+	if summary == "" {
+		summary = name
 	}
 
 	if width <= 0 {
@@ -486,19 +890,72 @@ func (s sessionInfo) displayLine(width int) string {
 	if available < 48 {
 		available = 48
 	}
-	pwdWidth := clampInt(available*3/10, 18, 32)
-	nameWidth := clampInt(available/5, 16, 28)
-	cmdWidth := available - pwdWidth - nameWidth - 2
-	if cmdWidth < 20 {
-		cmdWidth = 20
+	pwdWidth := clampInt(available*24/100, 16, 26)
+	cmdWidth := clampInt(available*14/100, 10, 18)
+	summaryWidth := available - pwdWidth - cmdWidth - 2
+	if summaryWidth < 20 {
+		summaryWidth = 20
 	}
 	return fmt.Sprintf(
-		"%s\t%-*s\t%-*s\t%-*s",
+		"%s\t%s\t%s\t%s",
 		s.Sock,
-		pwdWidth, fitField(pwd, pwdWidth),
-		cmdWidth, fitField(cmd, cmdWidth),
-		nameWidth, fitField(name, nameWidth),
+		padDisplayWidth(fitField(pwd, pwdWidth), pwdWidth),
+		padDisplayWidth(fitField(cmd, cmdWidth), cmdWidth),
+		padDisplayWidth(fitField(summary, summaryWidth), summaryWidth),
 	)
+}
+
+func formatDisplayPWD(pwd, status string, current bool) string {
+	if pwd == "" {
+		pwd = "-"
+	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if pwd == home {
+			pwd = "~"
+		} else if strings.HasPrefix(pwd, home+"/") {
+			pwd = "~/" + strings.TrimPrefix(pwd, home+"/")
+		}
+	}
+	prefix := ""
+	if current {
+		prefix = "▶ "
+	} else if status != "" {
+		prefix = status + " "
+	}
+	return prefix + pwd
+}
+
+func formatDisplayCommand(command []string, fallback string) string {
+	if len(command) == 0 {
+		return fallback
+	}
+	prog := command[0]
+	if strings.Contains(prog, "/") {
+		prog = filepath.Base(prog)
+	}
+	args := make([]string, 0, len(command))
+	args = append(args, prog)
+	for _, arg := range command[1:] {
+		if arg == "--dangerously-skip-permissions" {
+			continue
+		}
+		args = append(args, arg)
+	}
+	res := strings.Join(args, " ")
+	if res == "" {
+		return fallback
+	}
+	return res
+}
+
+var sessionSuffixRe = regexp.MustCompile(`-dm[a-z0-9]{8,}-[0-9]+$`)
+
+func cleanSessionName(name, sock string) string {
+	if name == "" {
+		name = strings.TrimSuffix(filepath.Base(sock), ".sock")
+	}
+	name = sessionSuffixRe.ReplaceAllString(name, "")
+	name = strings.ReplaceAll(name, "---dangerously-skip-permissions", "")
+	return name
 }
 
 func clampInt(value, min, max int) int {
@@ -515,14 +972,67 @@ func fitField(value string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	runes := []rune(value)
-	if len(runes) <= width {
+	if runeDisplayWidth(value) <= width {
 		return value
 	}
 	if width <= 3 {
-		return string(runes[:width])
+		var out strings.Builder
+		w := 0
+		for _, r := range value {
+			rw := singleRuneWidth(r)
+			if w+rw > width {
+				break
+			}
+			out.WriteRune(r)
+			w += rw
+		}
+		return out.String()
 	}
-	return string(runes[:width-3]) + "..."
+	target := width - 3
+	var out strings.Builder
+	w := 0
+	for _, r := range value {
+		rw := singleRuneWidth(r)
+		if w+rw > target {
+			break
+		}
+		out.WriteRune(r)
+		w += rw
+	}
+	return out.String() + "..."
+}
+
+func padDisplayWidth(value string, width int) string {
+	w := runeDisplayWidth(value)
+	if w >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-w)
+}
+
+func runeDisplayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		w += singleRuneWidth(r)
+	}
+	return w
+}
+
+func singleRuneWidth(r rune) int {
+	if r >= 0x1100 &&
+		(r <= 0x115f || r == 0x2329 || r == 0x232a ||
+			(r >= 0x2e80 && r <= 0xa4cf && r != 0x303f) ||
+			(r >= 0xac00 && r <= 0xd7a3) ||
+			(r >= 0xf900 && r <= 0xfaff) ||
+			(r >= 0xfe10 && r <= 0xfe19) ||
+			(r >= 0xfe30 && r <= 0xfe6f) ||
+			(r >= 0xff00 && r <= 0xff60) ||
+			(r >= 0xffe0 && r <= 0xffe6) ||
+			(r >= 0x1f300 && r <= 0x1faff) ||
+			(r >= 0x20000 && r <= 0x3fffd)) {
+		return 2
+	}
+	return 1
 }
 
 func allSessions() ([]sessionInfo, error) {
@@ -556,13 +1066,16 @@ func listSessions() error {
 	if err != nil {
 		return err
 	}
+	sessions = orderAndEnrichSessions(sessions, "")
+	width, _ := terminalSize()
+	if width <= 0 {
+		width = 120
+	}
 	for _, session := range sessions {
-		meta := session.Meta
-		name := meta.Name
-		if name == "" {
-			name = strings.TrimSuffix(filepath.Base(session.Sock), ".sock")
+		fields := strings.Split(session.displayLine(width), "\t")
+		if len(fields) >= 4 {
+			fmt.Printf("%s\t%s\t%s\n", fields[1], fields[2], strings.TrimRight(fields[3], " "))
 		}
-		fmt.Printf("%-56s\t%-56s\t%s\n", meta.PWD, strings.Join(meta.Command, " "), name)
 	}
 	return nil
 }
@@ -685,6 +1198,14 @@ func startServer(sock string, args []string) error {
 	cmd.Stdin = devNull
 	cmd.Stdout = devNull
 	cmd.Stderr = devNull
+	env := os.Environ()
+	if cols, rows := terminalSize(); cols > 0 && rows > 0 {
+		env = append(env,
+			fmt.Sprintf("DI_INITIAL_COLS=%d", cols),
+			fmt.Sprintf("DI_INITIAL_ROWS=%d", rows),
+		)
+	}
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return err
@@ -698,35 +1219,78 @@ func waitSocket(sock string, timeout time.Duration) error {
 		if isSocket(sock) {
 			return nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	return fmt.Errorf("d: session socket was not created: %s", sock)
 }
 
 func attach(sock string) error {
+	return attachSession(sock, false)
+}
+
+func attachSession(sock string, reattach bool) error {
+	currentSock := sock
+	for {
+		switchSession, err := attachOnce(currentSock, reattach)
+		if err != nil || !switchSession {
+			return err
+		}
+		selected, pickErr := pickSession(currentSock)
+		if pickErr != nil {
+			return pickErr
+		}
+		if selected != "" {
+			currentSock = selected
+			reattach = true
+			continue
+		}
+		if !sessionReachable(currentSock) {
+			return nil
+		}
+		reattach = true
+	}
+}
+
+func attachOnce(sock string, reattach bool) (bool, error) {
 	conn, err := dialSession(sock)
 	if err != nil {
 		removeSessionFiles(sock)
-		return err
+		return false, err
 	}
 	defer conn.Close()
 
 	oldTerm, err := makeRaw(0)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer restoreTerm(0, oldTerm)
 
-	_ = sendWindowSize(conn)
-	go watchWindowSize(conn)
+	if reattach {
+		_ = sendWindowSizeBounce(conn)
+	} else {
+		_ = sendWindowSize(conn)
+	}
+	stopWinch := make(chan struct{})
+	defer close(stopWinch)
+	go watchWindowSize(conn, stopWinch)
 
 	done := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(os.Stdout, conn)
+		forwardSessionOutput(os.Stdout, conn)
 		close(done)
 	}()
+	// Stop and drain forwarded output before restoring terminal state. Otherwise
+	// an already-read agent status can arrive after the cleanup on detach.
+	defer func() {
+		_ = conn.Close()
+		<-done
+	}()
 
-	inputErr := make(chan error, 1)
+	type inputResult struct {
+		switchSession bool
+		err           error
+	}
+	inputCh := make(chan inputResult, 1)
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -734,19 +1298,23 @@ func attach(sock string) error {
 			if n > 0 {
 				chunk := buf[:n]
 				if isDetachInput(chunk) {
-					inputErr <- nil
+					inputCh <- inputResult{}
+					return
+				}
+				if isSwitchInput(chunk) {
+					inputCh <- inputResult{switchSession: true}
 					return
 				}
 				if isMouseWheelInput(chunk) {
 					continue
 				}
 				if err := writeFrame(conn, frameInput, chunk); err != nil {
-					inputErr <- err
+					inputCh <- inputResult{err: err}
 					return
 				}
 			}
 			if err != nil {
-				inputErr <- err
+				inputCh <- inputResult{err: err}
 				return
 			}
 		}
@@ -754,12 +1322,14 @@ func attach(sock string) error {
 
 	select {
 	case <-done:
-		return nil
-	case err := <-inputErr:
-		if err == nil {
+		return false, nil
+	case res := <-inputCh:
+		_ = conn.Close()
+		<-done
+		if res.err == nil {
 			clearLocalScreen()
 		}
-		return err
+		return res.switchSession, res.err
 	}
 }
 
@@ -789,11 +1359,20 @@ func runServer(args []string) error {
 	defer master.Close()
 	defer slave.Close()
 
+	initialCols := positiveEnvInt("DI_INITIAL_COLS", 0)
+	initialRows := positiveEnvInt("DI_INITIAL_ROWS", 0)
+	if initialCols > 0 && initialRows > 0 {
+		_ = pty.Setsize(master, &pty.Winsize{
+			Rows: uint16(initialRows),
+			Cols: uint16(initialCols),
+		})
+	}
+
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdin = slave
 	cmd.Stdout = slave
 	cmd.Stderr = slave
-	cmd.Env = os.Environ()
+	cmd.Env = filterInternalEnv(os.Environ())
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true, Ctty: 0}
 	if err := cmd.Start(); err != nil {
 		return err
@@ -804,6 +1383,8 @@ func runServer(args []string) error {
 		master:      master,
 		clients:     map[net.Conn]struct{}{},
 		clientReady: make(chan struct{}),
+		lastRows:    uint16(initialRows),
+		lastCols:    uint16(initialCols),
 	}
 	ptyDone := make(chan struct{})
 	go func() {
@@ -841,14 +1422,21 @@ func runServer(args []string) error {
 }
 
 type ptyServer struct {
-	mu          sync.Mutex
-	master      *os.File
-	clients     map[net.Conn]struct{}
-	history     []byte
-	readyOnce   sync.Once
-	clientReady chan struct{}
-	clientWG    sync.WaitGroup
-	closing     bool
+	mu                sync.Mutex
+	master            *os.File
+	clients           map[net.Conn]struct{}
+	history           []byte
+	hasRedrawTail     bool
+	lastRedrawOffset  int
+	lastRedrawDown    int
+	lastRows          uint16
+	lastCols          uint16
+	initialResizeDone bool
+	resizeSeq         uint64
+	readyOnce         sync.Once
+	clientReady       chan struct{}
+	clientWG          sync.WaitGroup
+	closing           bool
 }
 
 func (s *ptyServer) markClientReady() {
@@ -899,20 +1487,37 @@ func (s *ptyServer) closeClientsLocked() {
 	}
 }
 
+const (
+	decrqmSyncOutput = "\x1b[?2026$p"
+	decrpmSyncOutput = "\x1b[?2026;2$y"
+	syncUpdateBegin  = "\x1b[?2026h"
+	syncUpdateEnd    = "\x1b[?2026l"
+	clearScreenHome  = "\x1b[2J\x1b[H"
+	clearAllHome     = "\x1b[2J\x1b[3J\x1b[H"
+)
+
 func (s *ptyServer) broadcastPTY() {
-	buf := make([]byte, 4096)
+	buf := make([]byte, 64<<10)
 	for {
 		n, err := s.master.Read(buf)
 		if n > 0 {
-			s.mu.Lock()
-			s.appendHistory(buf[:n])
-			for conn := range s.clients {
-				if _, werr := conn.Write(buf[:n]); werr != nil {
-					_ = conn.Close()
-					delete(s.clients, conn)
-				}
+			chunk := buf[:n]
+			if bytes.Contains(chunk, []byte(decrqmSyncOutput)) {
+				_, _ = s.master.Write([]byte(decrpmSyncOutput))
+				chunk = bytes.ReplaceAll(chunk, []byte(decrqmSyncOutput), nil)
 			}
-			s.mu.Unlock()
+			chunk = normalizeScrollbackClear(chunk)
+			if len(chunk) > 0 {
+				s.mu.Lock()
+				s.appendHistory(chunk)
+				for conn := range s.clients {
+					if _, werr := conn.Write(chunk); werr != nil {
+						_ = conn.Close()
+						delete(s.clients, conn)
+					}
+				}
+				s.mu.Unlock()
+			}
 		}
 		if err != nil {
 			return
@@ -921,15 +1526,39 @@ func (s *ptyServer) broadcastPTY() {
 }
 
 func (s *ptyServer) appendHistory(p []byte) {
-	const maxHistory = 64 << 10
-	s.history = append(s.history, p...)
+	const maxHistory = 512 << 10
+	p = normalizeScrollbackClear(p)
+	if idx := lastFullClearIndex(p); idx >= 0 {
+		s.history = nil
+		s.hasRedrawTail = false
+		s.lastRedrawOffset = 0
+		s.lastRedrawDown = 0
+		p = p[idx:]
+	}
+	if up, down, ok := parseInPlaceRedrawFrame(p); ok {
+		if s.hasRedrawTail && up >= s.lastRedrawDown && s.lastRedrawOffset <= len(s.history) {
+			s.history = append(s.history[:s.lastRedrawOffset], p...)
+			s.lastRedrawDown = down
+		} else {
+			s.lastRedrawOffset = len(s.history)
+			s.lastRedrawDown = down
+			s.hasRedrawTail = true
+			s.history = append(s.history, p...)
+		}
+	} else {
+		s.hasRedrawTail = false
+		s.history = append(s.history, p...)
+	}
 	if len(s.history) > maxHistory {
-		s.history = append([]byte(nil), s.history[len(s.history)-maxHistory:]...)
+		trimmed := trimHistorySlice(s.history[len(s.history)-maxHistory:])
+		s.history = append([]byte(nil), trimmed...)
+		s.hasRedrawTail = false
 	}
 }
 
 func (s *ptyServer) handle(conn net.Conn) {
 	defer s.remove(conn)
+	firstResize := true
 	for {
 		typ, payload, err := readFrame(conn)
 		if err != nil {
@@ -941,15 +1570,268 @@ func (s *ptyServer) handle(conn net.Conn) {
 			_, _ = s.master.Write(payload)
 		case frameResize:
 			if len(payload) == 8 {
-				rows := binary.BigEndian.Uint32(payload[:4])
-				cols := binary.BigEndian.Uint32(payload[4:])
-				_ = pty.Setsize(s.master, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+				rows := uint16(binary.BigEndian.Uint32(payload[:4]))
+				cols := uint16(binary.BigEndian.Uint32(payload[4:]))
+				isFirst := firstResize
+				firstResize = false
+				s.applyResize(rows, cols, isFirst)
 			}
 		case frameDetachAll:
 			s.closeClients()
 			return
 		}
 	}
+}
+
+func (s *ptyServer) applyResize(rows, cols uint16, firstForConn bool) {
+	if rows == 0 || cols == 0 {
+		return
+	}
+	s.mu.Lock()
+	shouldBounce := firstForConn && s.initialResizeDone && s.lastRows == rows && s.lastCols == cols
+	s.initialResizeDone = true
+	s.resizeSeq++
+	seq := s.resizeSeq
+	if !shouldBounce {
+		s.lastRows = rows
+		s.lastCols = cols
+		_ = pty.Setsize(s.master, &pty.Winsize{Rows: rows, Cols: cols})
+		s.mu.Unlock()
+		return
+	}
+	bounceCols := bounceColumnCount(cols)
+	s.lastRows = rows
+	s.lastCols = bounceCols
+	_ = pty.Setsize(s.master, &pty.Winsize{Rows: rows, Cols: bounceCols})
+	s.mu.Unlock()
+
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.closing || s.resizeSeq != seq {
+			return
+		}
+		s.lastRows = rows
+		s.lastCols = cols
+		_ = pty.Setsize(s.master, &pty.Winsize{Rows: rows, Cols: cols})
+	}()
+}
+
+func bounceColumnCount(cols uint16) uint16 {
+	if cols > 1 {
+		return cols - 1
+	}
+	return cols + 1
+}
+
+func filterInternalEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "DI_INITIAL_COLS=") || strings.HasPrefix(kv, "DI_INITIAL_ROWS=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
+func normalizeScrollbackClear(chunk []byte) []byte {
+	if !bytes.Contains(chunk, []byte(clearScreenHome)) {
+		return chunk
+	}
+	return bytes.ReplaceAll(chunk, []byte(clearScreenHome), []byte(clearAllHome))
+}
+
+func lastFullClearIndex(p []byte) int {
+	idxAll := bytes.LastIndex(p, []byte(clearAllHome))
+	idxScreen := bytes.LastIndex(p, []byte(clearScreenHome))
+	return max(idxAll, idxScreen)
+}
+
+// parseInPlaceRedrawFrame detects cursor-up viewport redraw frames (such as
+// Antigravity CLI's cursedRenderer frames starting with \r\x1b[<N>A) that
+// rewrite the active bottom viewport in place without pushing new lines into
+// scrollback (linefeeds <= N).
+func parseInPlaceRedrawFrame(p []byte) (up int, down int, ok bool) {
+	if len(p) < 6 || bytes.Contains(p, []byte("\x1b[2J")) || bytes.Contains(p, []byte("\x1b[3J")) {
+		return 0, 0, false
+	}
+	search := p
+	if len(search) > 64 {
+		search = search[:64]
+	}
+	up = parseLeadingCursorUp(search)
+	if up <= 0 {
+		return 0, 0, false
+	}
+	if !bytes.Contains(p, []byte("\x1b[K")) && !bytes.Contains(p, []byte("\x1b[J")) {
+		return 0, 0, false
+	}
+	down = bytes.Count(p, []byte("\n"))
+	if down > up {
+		return 0, 0, false
+	}
+	return up, down, true
+}
+
+func parseLeadingCursorUp(prefix []byte) int {
+	for i := 0; i+3 < len(prefix); i++ {
+		if prefix[i] != '\r' || prefix[i+1] != 0x1b || prefix[i+2] != '[' {
+			continue
+		}
+		j := i + 3
+		n := 0
+		for j < len(prefix) && prefix[j] >= '0' && prefix[j] <= '9' {
+			n = n*10 + int(prefix[j]-'0')
+			j++
+		}
+		if n > 0 && j < len(prefix) && prefix[j] == 'A' {
+			return n
+		}
+	}
+	return 0
+}
+
+func trimHistorySlice(b []byte) []byte {
+	// Skip leading UTF-8 continuation bytes so we never start mid-rune.
+	i := 0
+	for i < len(b) && i < 4 && (b[i]&0xc0) == 0x80 {
+		i++
+	}
+	b = b[i:]
+	// If the slice begins inside an unfinished CSI/OSC escape sequence (no ESC
+	// before a CSI terminator within the first 32 bytes), advance to the first
+	// ESC or newline if present.
+	limit := min(len(b), 32)
+	for j := 0; j < limit; j++ {
+		if b[j] == 0x1b || b[j] == '\n' || b[j] == '\r' {
+			break
+		}
+		if b[j] == '[' && j > 0 {
+			break
+		}
+	}
+	return b
+}
+
+func forwardSessionOutput(dst io.Writer, conn net.Conn) {
+	const maxBatch = 64 << 10
+	buf := make([]byte, 32<<10)
+	batch := make([]byte, 0, maxBatch)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			batch = append(batch[:0], buf[:n]...)
+			for len(batch) < maxBatch && needsMoreFrameBytes(batch) {
+				if derr := conn.SetReadDeadline(time.Now().Add(2 * time.Millisecond)); derr != nil {
+					break
+				}
+				m, rerr := conn.Read(buf[:min(len(buf), maxBatch-len(batch))])
+				if m > 0 {
+					batch = append(batch, buf[:m]...)
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			_ = conn.SetReadDeadline(time.Time{})
+			out := normalizeScrollbackClear(batch)
+			if shouldWrapSyncOutput(out) {
+				wrapped := make([]byte, 0, len(syncUpdateBegin)+len(out)+len(syncUpdateEnd))
+				wrapped = append(wrapped, syncUpdateBegin...)
+				wrapped = append(wrapped, out...)
+				wrapped = append(wrapped, syncUpdateEnd...)
+				out = wrapped
+			}
+			if _, werr := dst.Write(out); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, syscall.EAGAIN) {
+				_ = conn.SetReadDeadline(time.Time{})
+				continue
+			}
+			return
+		}
+	}
+}
+
+func needsMoreFrameBytes(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	// Unclosed synchronized update block.
+	if lastBegin := bytes.LastIndex(b, []byte(syncUpdateBegin)); lastBegin >= 0 {
+		if bytes.LastIndex(b, []byte(syncUpdateEnd)) < lastBegin {
+			return true
+		}
+	}
+	// In-place multi-line redraw that hid the cursor (\x1b[?25l) and has not
+	// restored it (\x1b[?25h) yet.
+	if isMultiLineRedraw(b) {
+		lastHide := bytes.LastIndex(b, []byte("\x1b[?25l"))
+		lastShow := bytes.LastIndex(b, []byte("\x1b[?25h"))
+		if lastHide >= 0 && lastShow < lastHide {
+			return true
+		}
+		if !bytes.HasSuffix(b, []byte("\x1b[?25h")) && !bytes.HasSuffix(b, []byte(syncUpdateEnd)) && len(b) >= 4096 {
+			return true
+		}
+	}
+	return hasIncompleteTrailingSequence(b)
+}
+
+func hasIncompleteTrailingSequence(b []byte) bool {
+	// Check for an incomplete trailing UTF-8 rune.
+	start := max(len(b)-4, 0)
+	for i := len(b) - 1; i >= start; i-- {
+		if (b[i] & 0x80) == 0 {
+			break
+		}
+		if (b[i] & 0xc0) == 0xc0 {
+			if !utf8.FullRune(b[i:]) {
+				return true
+			}
+			break
+		}
+	}
+	// Check for an incomplete trailing CSI escape sequence (\x1b[...).
+	escIdx := bytes.LastIndexByte(b, 0x1b)
+	if escIdx >= 0 && len(b)-escIdx <= 16 {
+		tail := b[escIdx:]
+		if len(tail) == 1 {
+			return true
+		}
+		if tail[1] == '[' {
+			for i := 2; i < len(tail); i++ {
+				if tail[i] >= 0x40 && tail[i] <= 0x7e {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func isMultiLineRedraw(b []byte) bool {
+	if bytes.Contains(b, []byte("\x1b[J")) || bytes.Contains(b, []byte("\x1b[2J")) {
+		return true
+	}
+	search := b
+	if len(search) > 64 {
+		search = search[:64]
+	}
+	return parseLeadingCursorUp(search) > 0
+}
+
+func shouldWrapSyncOutput(b []byte) bool {
+	if bytes.Contains(b, []byte(syncUpdateBegin)) {
+		return false
+	}
+	return isMultiLineRedraw(b) && (bytes.Contains(b, []byte("\x1b[K")) || bytes.Contains(b, []byte("\x1b[J")))
 }
 
 func openPTY() (*os.File, *os.File, error) {
@@ -960,9 +1842,13 @@ func makeRaw(fd int) (*term.State, error) {
 	return term.MakeRaw(fd)
 }
 
+const terminalStatusReset = "\x18\x1b]7501;state=clear\x07\x1b]21337;status=\x07\x1b]9;4;0\x07"
+
 func restoreTerm(fd int, state *term.State) {
 	_ = term.Restore(fd, state)
-	fmt.Print("\x1b[?25h\x1b[0m")
+	// Detach ends this terminal's attachment, not the background agent's turn.
+	// Cancel a truncated escape sequence before clearing its inherited status.
+	fmt.Print(terminalStatusReset + "\x1b[?25h\x1b[0m")
 }
 
 func clearLocalScreen() {
@@ -974,17 +1860,43 @@ func sendWindowSize(w io.Writer) error {
 	if err != nil {
 		return nil
 	}
+	return writeResizeFrame(w, height, width)
+}
+
+func sendWindowSizeBounce(w io.Writer) error {
+	width, height, err := term.GetSize(0)
+	if err != nil || width <= 0 || height <= 0 {
+		return nil
+	}
+	bounceCols := int(bounceColumnCount(uint16(width)))
+	if err := writeResizeFrame(w, height, bounceCols); err != nil {
+		return err
+	}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		_ = writeResizeFrame(w, height, width)
+	}()
+	return nil
+}
+
+func writeResizeFrame(w io.Writer, rows, cols int) error {
 	payload := make([]byte, 8)
-	binary.BigEndian.PutUint32(payload[:4], uint32(height))
-	binary.BigEndian.PutUint32(payload[4:], uint32(width))
+	binary.BigEndian.PutUint32(payload[:4], uint32(rows))
+	binary.BigEndian.PutUint32(payload[4:], uint32(cols))
 	return writeFrame(w, frameResize, payload)
 }
 
-func watchWindowSize(w io.Writer) {
+func watchWindowSize(w io.Writer, stop <-chan struct{}) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
-	for range ch {
-		_ = sendWindowSize(w)
+	defer signal.Stop(ch)
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ch:
+			_ = sendWindowSize(w)
+		}
 	}
 }
 
@@ -1033,10 +1945,25 @@ func isDetachInput(buf []byte) bool {
 	return enhancedDetachInput(buf, key)
 }
 
+func isSwitchInput(buf []byte) bool {
+	key := switchKeyByte()
+	if len(buf) == 1 && buf[0] == key {
+		return true
+	}
+	return enhancedDetachInput(buf, key)
+}
+
 func detachKeyByte() byte {
-	key := os.Getenv("D_DETACH")
+	return parseCtrlKey(os.Getenv("D_DETACH"), defaultDetachKey)
+}
+
+func switchKeyByte() byte {
+	return parseCtrlKey(os.Getenv("D_SWITCH"), defaultSwitchKey)
+}
+
+func parseCtrlKey(key, fallback string) byte {
 	if key == "" {
-		key = defaultDetachKey
+		key = fallback
 	}
 	if len(key) >= 2 && key[0] == '^' {
 		if key[1] == '?' {

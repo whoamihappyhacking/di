@@ -14,24 +14,265 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/creack/pty"
 )
 
-func TestFZFArgsUseFourLineSelectionList(t *testing.T) {
+func TestAttachStatusCleanup(t *testing.T) {
+	for _, mode := range []string{"local-detach", "remote-detach", "eof"} {
+		t.Run(mode, func(t *testing.T) {
+			sock := filepath.Join(t.TempDir(), "session.sock")
+			listener, err := net.Listen("unix", sock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			serverDone := make(chan struct{})
+			go func() {
+				defer close(serverDone)
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_, _ = io.WriteString(conn, "\x1b]7501;state=working\x07STATUS_READY")
+				if mode != "local-detach" {
+					return
+				}
+				_, _ = io.Copy(io.Discard, conn)
+			}()
+			cmd := exec.Command(os.Args[0], "-test.run=^TestAttachStatusHelper$", "--", sock)
+			cmd.Env = append(os.Environ(), "DI_ATTACH_TEST=1", "D_DETACH=^]")
+			master, err := pty.Start(cmd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer master.Close()
+			outputDone := make(chan []byte, 1)
+			go func() {
+				var output bytes.Buffer
+				buffer := make([]byte, 4096)
+				detached := false
+				for {
+					n, err := master.Read(buffer)
+					output.Write(buffer[:n])
+					if mode == "local-detach" && !detached && bytes.Contains(output.Bytes(), []byte("STATUS_READY")) {
+						detached = true
+						_, _ = master.Write([]byte{0x1d})
+					}
+					if err != nil {
+						outputDone <- output.Bytes()
+						return
+					}
+				}
+			}()
+			waitDone := make(chan error, 1)
+			go func() { waitDone <- cmd.Wait() }()
+			select {
+			case err := <-waitDone:
+				if err != nil {
+					t.Fatalf("attach helper: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("attach did not exit")
+			}
+			output := <-outputDone
+			working := bytes.LastIndex(output, []byte("\x1b]7501;state=working\x07"))
+			reset := bytes.LastIndex(output, []byte(terminalStatusReset))
+			if working < 0 || reset <= working {
+				t.Fatalf("missing ordered status cleanup: %q", output)
+			}
+			if bytes.Contains(output[reset:], []byte("state=done")) {
+				t.Fatal("detach must not report task completion")
+			}
+			<-serverDone
+		})
+	}
+}
+
+func TestAttachStatusHelper(t *testing.T) {
+	if os.Getenv("DI_ATTACH_TEST") != "1" {
+		return
+	}
+	if err := attach(os.Args[len(os.Args)-1]); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAppendHistoryDeduplicatesInPlaceRedrawsAndPreservesScrollback(t *testing.T) {
+	s := &ptyServer{}
+	// Scrollback push: moves up 2 lines, writes 5 lines (down 4 > up 2).
+	s.appendHistory([]byte("\r\x1b[2Ascrollback-line-1\r\nscrollback-line-2\r\nscrollback-line-3\r\nviewport-1\r\nviewport-2"))
+	// Consecutive in-place spinner redraws: moves up 2 lines, writes 3 lines (down 2 <= up 2).
+	for i := 0; i < 50; i++ {
+		s.appendHistory([]byte(fmt.Sprintf("\r\x1b[2A\x1b[Kspinner-tick-%d\r\n\x1b[Kprompt-line-%d\r\n\x1b[Kstatus", i, i)))
+	}
+	hist := string(s.history)
+	if !strings.Contains(hist, "scrollback-line-1") || !strings.Contains(hist, "scrollback-line-3") {
+		t.Fatalf("scrollback lines were evicted by in-place redraws: %q", hist)
+	}
+	if strings.Contains(hist, "spinner-tick-0") || strings.Contains(hist, "spinner-tick-48") {
+		t.Fatalf("stale in-place redraw frame remained in history: %q", hist)
+	}
+	if !strings.Contains(hist, "spinner-tick-49") {
+		t.Fatalf("latest in-place redraw frame missing from history: %q", hist)
+	}
+
+	// Full screen clear resets history to the clear point.
+	s.appendHistory([]byte("before-clear\x1b[2J\x1b[Hfresh-history-after-resize"))
+	histAfterClear := string(s.history)
+	if strings.Contains(histAfterClear, "scrollback-line-1") || strings.Contains(histAfterClear, "before-clear") {
+		t.Fatalf("history kept content prior to full screen clear: %q", histAfterClear)
+	}
+	if !strings.HasPrefix(histAfterClear, "\x1b[2J\x1b[3J\x1b[Hfresh-history-after-resize") {
+		t.Fatalf("full screen clear was not normalized to clear scrollback: %q", histAfterClear)
+	}
+}
+
+func TestForwardSessionOutputCoalescesAndSynchronizesRedraws(t *testing.T) {
+	connReader, connWriter := net.Pipe()
+	defer connReader.Close()
+
+	go func() {
+		// Send an unwrapped multi-line redraw split across two chunks, plus a full clear.
+		_, _ = connWriter.Write([]byte("\r\x1b[3A\x1b[Jline-1\r\n"))
+		_, _ = connWriter.Write([]byte("\x1b[Kline-2\r\n\x1b[Kline-3\x1b[2J\x1b[H"))
+		_ = connWriter.Close()
+	}()
+
+	var dst bytes.Buffer
+	forwardSessionOutput(&dst, connReader)
+	got := dst.String()
+	if !strings.HasPrefix(got, "\x1b[?2026h") || !strings.HasSuffix(got, "\x1b[?2026l") {
+		t.Fatalf("multi-line redraw was not wrapped in synchronized output markers: %q", got)
+	}
+	if !strings.Contains(got, "\x1b[2J\x1b[3J\x1b[H") {
+		t.Fatalf("full screen clear was not upgraded to clear scrollback: %q", got)
+	}
+}
+
+func TestRunServerAnswersSyncOutputQueryAndReattachesWithSameSizeBounce(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh is not available")
+	}
+
+	// Child queries DECRQM 2026, prints whether it received 2026;2$y, and prints WINCH on SIGWINCH.
+	script := `trap 'printf "\nWINCH\n"' WINCH; stty -echo raw; printf '\033[?2026$p'; dd bs=1 count=11 2>/dev/null; sleep 0.3`
+	output := runServerAndReadWithSameSizeReattach(t, []string{sh, "-c", script})
+	if !bytes.Contains(output, []byte("\x1b[?2026;2$y")) {
+		t.Fatalf("server did not reply to DECRQM 2026 query: %q", output)
+	}
+	if !bytes.Contains(output, []byte("WINCH")) {
+		t.Fatalf("server did not trigger SIGWINCH bounce on re-attach: %q", output)
+	}
+}
+
+func runServerAndReadWithSameSizeReattach(t *testing.T, command []string) []byte {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "session.sock")
+	done := make(chan error, 1)
+	go func() {
+		done <- runServer(append([]string{sock}, command...))
+	}()
+
+	if err := waitSocket(sock, serverStartWait); err != nil {
+		t.Fatal(err)
+	}
+
+	resize := make([]byte, 8)
+	binary.BigEndian.PutUint32(resize[:4], 24)
+	binary.BigEndian.PutUint32(resize[4:], 80)
+
+	// First attach sets 24x80, then detaches.
+	conn1, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFrame(conn1, frameResize, resize); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	_ = conn1.Close()
+
+	// Second attach sends the exact same 24x80 size; server should bounce cols to trigger SIGWINCH.
+	conn2, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	if err := writeFrame(conn2, frameResize, resize); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn2.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(conn2)
+	if err != nil {
+		t.Fatalf("read server output: %v", err)
+	}
+	<-done
+	return output
+}
+
+func TestFZFArgsReserveExpandedSelectionListAndBindSwitchKey(t *testing.T) {
 	args := fzfArgs("/tmp/di", 24)
 	if !containsArg(args, "--height=100%") {
 		t.Fatalf("picker should use the full terminal height: %v", args)
 	}
-	if !containsArg(args, "--preview-window=down,18,wrap,border-top") {
-		t.Fatalf("picker should reserve four lines for selection: %v", args)
+	if !containsArg(args, "--preview-window=down,13,wrap,border-top") {
+		t.Fatalf("picker should reserve expanded selection rows: %v", args)
 	}
-	if containsArg(args, "--preview-window=down,60%,wrap,border-top") {
-		t.Fatalf("picker should use a fixed four-line selection area: %v", args)
+	if !containsArg(args, `--bind=ctrl-\:down`) {
+		t.Fatalf("picker should bind Ctrl-\\ to move down: %v", args)
 	}
 	if !containsArg(args, "--no-hscroll") {
 		t.Fatalf("picker should keep aligned columns in view: %v", args)
 	}
 	if !containsArg(args, "--preview='/tmp/di' --preview {1}") {
 		t.Fatalf("preview command should pass the socket field: %v", args)
+	}
+}
+
+func TestSwitchKeyInput(t *testing.T) {
+	if !isSwitchInput([]byte{0x1c}) {
+		t.Fatal("default Ctrl-\\ (0x1c) was not recognized as switch input")
+	}
+	if !isSwitchInput([]byte("\x1b[92;5u")) {
+		t.Fatal("CSI u Ctrl-\\ sequence was not recognized as switch input")
+	}
+	if isSwitchInput([]byte{0x1d}) {
+		t.Fatal("Ctrl-] detach key must not trigger switch input")
+	}
+}
+
+func TestExtractSessionSummaryAndStatus(t *testing.T) {
+	rule := strings.Repeat("─", 94)
+	busyOutput := []byte(fmt.Sprintf(
+		"  上一轮对话内容\r\n  真正有价值的最近回复摘要\r\n\r\n%s\r\n>\r\n%s\r\n⣽  Read\r\n? for shortcuts",
+		rule, rule,
+	))
+	status, summary := extractSessionSummary(busyOutput)
+	if status != "●" {
+		t.Fatalf("status = %q, want ● for active spinner", status)
+	}
+	if !strings.Contains(summary, "[Read]") || !strings.Contains(summary, "真正有价值的最近回复摘要") {
+		t.Fatalf("summary = %q, want tool name and latest conversation line", summary)
+	}
+}
+
+func TestRenderPreviewCollapsesPaddingAndPreservesConversation(t *testing.T) {
+	// Simulate a 33-row viewport redraw with 20 blank padding lines above the spinner.
+	var frame strings.Builder
+	frame.WriteString("对话第一行内容\r\n对话第二行内容\r\n")
+	for i := 0; i < 20; i++ {
+		frame.WriteString("\r\n")
+	}
+	frame.WriteString("⣟  Read\r\n")
+	preview := string(renderPreview([]byte(frame.String()), 80, 10))
+	if !strings.Contains(preview, "对话第一行内容") || !strings.Contains(preview, "⣟  Read") {
+		t.Fatalf("preview lost conversation text due to blank padding lines: %q", preview)
 	}
 }
 
