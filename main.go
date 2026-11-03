@@ -58,6 +58,8 @@ func main() {
 		err = previewSession(os.Args[2:])
 	} else if len(os.Args) > 1 && os.Args[1] == "--server" {
 		err = runServer(os.Args[2:])
+	} else if len(os.Args) > 2 && os.Args[1] == "--attach" {
+		err = attachSession(os.Args[2], true)
 	} else if len(os.Args) > 1 && os.Args[1] == "install" {
 		err = installSelf()
 	} else if filepath.Base(os.Args[0]) == "di" {
@@ -1242,12 +1244,25 @@ func attachSession(sock string, reattach bool) error {
 		if selected != "" {
 			currentSock = selected
 			reattach = true
+			maybeExecUpdatedBinary(currentSock)
 			continue
 		}
 		if !sessionReachable(currentSock) {
 			return nil
 		}
 		reattach = true
+		maybeExecUpdatedBinary(currentSock)
+	}
+}
+
+func maybeExecUpdatedBinary(sock string) {
+	link, err := os.Readlink("/proc/self/exe")
+	if err != nil || !strings.HasSuffix(link, " (deleted)") {
+		return
+	}
+	diskPath := strings.TrimSuffix(link, " (deleted)")
+	if info, statErr := os.Stat(diskPath); statErr == nil && !info.IsDir() {
+		_ = syscall.Exec(diskPath, []string{os.Args[0], "--attach", sock}, os.Environ())
 	}
 }
 
@@ -1290,6 +1305,7 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 		_ = sendWindowSize(conn)
 	}
 	go watchWindowSize(conn, stopWinch)
+	go watchScrollbackCheckpointRefresh(conn, tracker, stopWinch)
 
 	type inputResult struct {
 		switchSession bool
@@ -1681,6 +1697,14 @@ func parseInPlaceRedrawFrame(p []byte) (up int, down int, ok bool) {
 }
 
 func parseLeadingCursorUp(prefix []byte) int {
+	_, _, n, ok := parseLeadingCursorUpBounds(prefix)
+	if !ok {
+		return 0
+	}
+	return n
+}
+
+func parseLeadingCursorUpBounds(prefix []byte) (prefixEnd int, afterSeq int, up int, ok bool) {
 	for i := 0; i+3 < len(prefix); i++ {
 		if prefix[i] != '\r' || prefix[i+1] != 0x1b || prefix[i+2] != '[' {
 			continue
@@ -1692,10 +1716,96 @@ func parseLeadingCursorUp(prefix []byte) int {
 			j++
 		}
 		if n > 0 && j < len(prefix) && prefix[j] == 'A' {
-			return n
+			return i, j + 1, n, true
 		}
 	}
-	return 0
+	return 0, 0, 0, false
+}
+
+// inPlaceCompactor diffs consecutive equal-height cursor-up redraw frames
+// (\r\x1b[<N>A with N linefeeds) and strips unchanged top lines so 10 Hz
+// spinner updates only rewrite the bottom lines that actually changed.
+type inPlaceCompactor struct {
+	prevUp    int
+	prevLines [][]byte
+}
+
+func (c *inPlaceCompactor) reset() {
+	c.prevUp = 0
+	c.prevLines = nil
+}
+
+func (c *inPlaceCompactor) save(up int, lines [][]byte) {
+	c.prevUp = up
+	if cap(c.prevLines) < len(lines) {
+		c.prevLines = make([][]byte, len(lines))
+	} else {
+		c.prevLines = c.prevLines[:len(lines)]
+	}
+	for i, line := range lines {
+		c.prevLines[i] = append(c.prevLines[i][:0], line...)
+	}
+}
+
+func (c *inPlaceCompactor) compact(b []byte) (out []byte, skip bool) {
+	if c == nil {
+		return b, false
+	}
+	up, down, ok := parseInPlaceRedrawFrame(b)
+	if !ok || up <= 0 || down != up {
+		c.reset()
+		return b, false
+	}
+	search := b
+	if len(search) > 64 {
+		search = search[:64]
+	}
+	prefixEnd, afterSeq, parsedUp, ok := parseLeadingCursorUpBounds(search)
+	if !ok || parsedUp != up {
+		c.reset()
+		return b, false
+	}
+	lines := bytes.Split(b[afterSeq:], []byte("\n"))
+	if len(lines) != up+1 {
+		c.reset()
+		return b, false
+	}
+	if c.prevUp != up || len(c.prevLines) != len(lines) {
+		c.save(up, lines)
+		return b, false
+	}
+	firstDiff := len(lines)
+	for i := range lines {
+		if !bytes.Equal(lines[i], c.prevLines[i]) {
+			firstDiff = i
+			break
+		}
+	}
+	c.save(up, lines)
+	if firstDiff == len(lines) {
+		if !bytes.Contains(b[:prefixEnd], []byte("\x1b]")) {
+			return nil, true
+		}
+		firstDiff = len(lines) - 1
+	}
+	if firstDiff == 0 {
+		return b, false
+	}
+	remUp := up - firstDiff
+	var buf bytes.Buffer
+	buf.Grow(prefixEnd + 16 + len(b[afterSeq:])/2)
+	buf.Write(b[:prefixEnd])
+	buf.WriteString("\x1b[m\r")
+	if remUp > 0 {
+		fmt.Fprintf(&buf, "\x1b[%dA", remUp)
+	}
+	for i := firstDiff; i < len(lines); i++ {
+		if i > firstDiff {
+			buf.WriteByte('\n')
+		}
+		buf.Write(lines[i])
+	}
+	return buf.Bytes(), false
 }
 
 func trimHistorySlice(b []byte) []byte {
@@ -1714,18 +1824,28 @@ func trimHistorySlice(b []byte) []byte {
 	return b
 }
 
+const (
+	scrollbackRefreshSoftBytes = 750 << 10
+	scrollbackRefreshHardBytes = 1150 << 10
+)
+
 type redrawTracker struct {
-	mu            sync.Mutex
-	notify        chan struct{}
-	clearCount    int
-	lastReadTime  time.Time
-	lastClearTime time.Time
-	redrawSettled bool
+	mu               sync.Mutex
+	notify           chan struct{}
+	refreshCh        chan struct{}
+	clearCount       int
+	lastReadTime     time.Time
+	lastClearTime    time.Time
+	redrawSettled    bool
+	seenInitialClear bool
+	bounceActive     bool
+	bytesSinceClear  int
 }
 
 func newRedrawTracker() *redrawTracker {
 	return &redrawTracker{
-		notify: make(chan struct{}, 1),
+		notify:    make(chan struct{}, 1),
+		refreshCh: make(chan struct{}, 1),
 	}
 }
 
@@ -1737,20 +1857,39 @@ func (t *redrawTracker) observe(chunk []byte) {
 	hasClear := bytes.Contains(chunk, []byte("\x1b[2J"))
 	hasCursorShow := bytes.Contains(chunk, []byte("\x1b[?25h"))
 
+	shouldRefresh := false
 	t.mu.Lock()
 	t.lastReadTime = now
 	if hasClear {
 		t.clearCount++
 		t.lastClearTime = now
 		t.redrawSettled = hasCursorShow
-	} else if t.clearCount > 0 && hasCursorShow {
-		t.redrawSettled = true
+		t.seenInitialClear = true
+		if idx := lastFullClearIndex(chunk); idx >= 0 {
+			t.bytesSinceClear = len(chunk) - idx
+		} else {
+			t.bytesSinceClear = len(chunk)
+		}
+	} else {
+		if t.clearCount > 0 && hasCursorShow {
+			t.redrawSettled = true
+		}
+		t.bytesSinceClear += len(chunk)
+		if t.seenInitialClear && !t.bounceActive && t.bytesSinceClear >= scrollbackRefreshSoftBytes {
+			shouldRefresh = true
+		}
 	}
 	t.mu.Unlock()
 
 	select {
 	case t.notify <- struct{}{}:
 	default:
+	}
+	if shouldRefresh {
+		select {
+		case t.refreshCh <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -1763,6 +1902,37 @@ func (t *redrawTracker) snapshot() (clears int, lastRead time.Time, settled bool
 	return t.clearCount, t.lastReadTime, t.redrawSettled
 }
 
+func (t *redrawTracker) tryStartBounce() bool {
+	if t == nil {
+		return true
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.bounceActive {
+		return false
+	}
+	t.bounceActive = true
+	return true
+}
+
+func (t *redrawTracker) finishBounce() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.bounceActive = false
+	t.mu.Unlock()
+}
+
+func (t *redrawTracker) refreshStatus() (bytesSince int, lastRead time.Time, bounceActive bool) {
+	if t == nil {
+		return 0, time.Time{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.bytesSinceClear, t.lastReadTime, t.bounceActive
+}
+
 func forwardSessionOutput(dst io.Writer, conn net.Conn) {
 	forwardSessionOutputWithTracker(dst, conn, nil)
 }
@@ -1771,6 +1941,7 @@ func forwardSessionOutputWithTracker(dst io.Writer, conn net.Conn, tracker *redr
 	const maxBatch = 64 << 10
 	buf := make([]byte, 32<<10)
 	batch := make([]byte, 0, maxBatch)
+	var compactor inPlaceCompactor
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
@@ -1789,7 +1960,11 @@ func forwardSessionOutputWithTracker(dst io.Writer, conn net.Conn, tracker *redr
 			}
 			_ = conn.SetReadDeadline(time.Time{})
 			out := normalizeScrollbackClear(batch)
-			tracker.observe(out)
+			var skip bool
+			out, skip = compactor.compact(out)
+			if skip {
+				continue
+			}
 			if shouldWrapSyncOutput(out) {
 				wrapped := make([]byte, 0, len(syncUpdateBegin)+len(out)+len(syncUpdateEnd))
 				wrapped = append(wrapped, syncUpdateBegin...)
@@ -1797,6 +1972,7 @@ func forwardSessionOutputWithTracker(dst io.Writer, conn net.Conn, tracker *redr
 				wrapped = append(wrapped, syncUpdateEnd...)
 				out = wrapped
 			}
+			tracker.observe(out)
 			if _, werr := dst.Write(out); werr != nil {
 				return
 			}
@@ -1933,6 +2109,11 @@ func sendWindowSizeBounce(w io.Writer, tracker *redrawTracker, stop <-chan struc
 }
 
 func runWindowSizeBounce(w io.Writer, height, width int, tracker *redrawTracker, stop <-chan struct{}) {
+	if !tracker.tryStartBounce() {
+		return
+	}
+	defer tracker.finishBounce()
+
 	waitForInitialHistory(tracker, stop)
 	select {
 	case <-stop:
@@ -1974,6 +2155,42 @@ func runWindowSizeBounce(w io.Writer, height, width int, tracker *redrawTracker,
 				return
 			}
 			_ = writeResizeFrame(w, height, width)
+		}
+	}
+}
+
+// watchScrollbackCheckpointRefresh ensures that outer terminal multiplexers
+// with fixed-size raw-history ring buffers (such as LightOS WebShell's 1.75 MB
+// raw-history fallback) always retain at least one full \x1b[2J\x1b[3J\x1b[H
+// scrollback dump within their replay window.
+func watchScrollbackCheckpointRefresh(w io.Writer, tracker *redrawTracker, stop <-chan struct{}) {
+	if tracker == nil {
+		return
+	}
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tracker.refreshCh:
+		}
+		for {
+			bytesSince, lastRead, active := tracker.refreshStatus()
+			if active || bytesSince < scrollbackRefreshSoftBytes {
+				break
+			}
+			if bytesSince >= scrollbackRefreshHardBytes || (!lastRead.IsZero() && time.Since(lastRead) >= 250*time.Millisecond) {
+				width, height, err := term.GetSize(0)
+				if err == nil && width > 0 && height > 0 {
+					runWindowSizeBounce(w, height, width, tracker, stop)
+				}
+				if !sleepOrStop(500*time.Millisecond, stop) {
+					return
+				}
+				break
+			}
+			if !sleepOrStop(60*time.Millisecond, stop) {
+				return
+			}
 		}
 	}
 }
