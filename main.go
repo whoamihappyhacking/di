@@ -1266,17 +1266,13 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 	defer restoreTerm(0, oldTerm)
 
 	if reattach {
-		_ = sendWindowSizeBounce(conn)
-	} else {
-		_ = sendWindowSize(conn)
+		fmt.Print(mouseTrackingReset)
 	}
-	stopWinch := make(chan struct{})
-	defer close(stopWinch)
-	go watchWindowSize(conn, stopWinch)
 
+	tracker := newRedrawTracker()
 	done := make(chan struct{})
 	go func() {
-		forwardSessionOutput(os.Stdout, conn)
+		forwardSessionOutputWithTracker(os.Stdout, conn, tracker)
 		close(done)
 	}()
 	// Stop and drain forwarded output before restoring terminal state. Otherwise
@@ -1285,6 +1281,15 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 		_ = conn.Close()
 		<-done
 	}()
+
+	stopWinch := make(chan struct{})
+	defer close(stopWinch)
+	if reattach {
+		_ = sendWindowSizeBounce(conn, tracker, stopWinch)
+	} else {
+		_ = sendWindowSize(conn)
+	}
+	go watchWindowSize(conn, stopWinch)
 
 	type inputResult struct {
 		switchSession bool
@@ -1606,7 +1611,7 @@ func (s *ptyServer) applyResize(rows, cols uint16, firstForConn bool) {
 	s.mu.Unlock()
 
 	go func() {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(150 * time.Millisecond)
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if s.closing || s.resizeSeq != seq {
@@ -1700,22 +1705,69 @@ func trimHistorySlice(b []byte) []byte {
 		i++
 	}
 	b = b[i:]
-	// If the slice begins inside an unfinished CSI/OSC escape sequence (no ESC
-	// before a CSI terminator within the first 32 bytes), advance to the first
-	// ESC or newline if present.
-	limit := min(len(b), 32)
-	for j := 0; j < limit; j++ {
-		if b[j] == 0x1b || b[j] == '\n' || b[j] == '\r' {
-			break
-		}
-		if b[j] == '[' && j > 0 {
-			break
-		}
+	// Advance to the start of the first complete line so a truncated history
+	// buffer never begins inside an unfinished OSC-8 hyperlink or CSI sequence.
+	limit := min(len(b), 1024)
+	if nl := bytes.IndexByte(b[:limit], '\n'); nl >= 0 && nl+1 < len(b) {
+		return b[nl+1:]
 	}
 	return b
 }
 
+type redrawTracker struct {
+	mu            sync.Mutex
+	notify        chan struct{}
+	clearCount    int
+	lastReadTime  time.Time
+	lastClearTime time.Time
+	redrawSettled bool
+}
+
+func newRedrawTracker() *redrawTracker {
+	return &redrawTracker{
+		notify: make(chan struct{}, 1),
+	}
+}
+
+func (t *redrawTracker) observe(chunk []byte) {
+	if t == nil || len(chunk) == 0 {
+		return
+	}
+	now := time.Now()
+	hasClear := bytes.Contains(chunk, []byte("\x1b[2J"))
+	hasCursorShow := bytes.Contains(chunk, []byte("\x1b[?25h"))
+
+	t.mu.Lock()
+	t.lastReadTime = now
+	if hasClear {
+		t.clearCount++
+		t.lastClearTime = now
+		t.redrawSettled = hasCursorShow
+	} else if t.clearCount > 0 && hasCursorShow {
+		t.redrawSettled = true
+	}
+	t.mu.Unlock()
+
+	select {
+	case t.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (t *redrawTracker) snapshot() (clears int, lastRead time.Time, settled bool) {
+	if t == nil {
+		return 0, time.Time{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.clearCount, t.lastReadTime, t.redrawSettled
+}
+
 func forwardSessionOutput(dst io.Writer, conn net.Conn) {
+	forwardSessionOutputWithTracker(dst, conn, nil)
+}
+
+func forwardSessionOutputWithTracker(dst io.Writer, conn net.Conn, tracker *redrawTracker) {
 	const maxBatch = 64 << 10
 	buf := make([]byte, 32<<10)
 	batch := make([]byte, 0, maxBatch)
@@ -1737,6 +1789,7 @@ func forwardSessionOutput(dst io.Writer, conn net.Conn) {
 			}
 			_ = conn.SetReadDeadline(time.Time{})
 			out := normalizeScrollbackClear(batch)
+			tracker.observe(out)
 			if shouldWrapSyncOutput(out) {
 				wrapped := make([]byte, 0, len(syncUpdateBegin)+len(out)+len(syncUpdateEnd))
 				wrapped = append(wrapped, syncUpdateBegin...)
@@ -1769,15 +1822,18 @@ func needsMoreFrameBytes(b []byte) bool {
 		}
 	}
 	// In-place multi-line redraw that hid the cursor (\x1b[?25l) and has not
-	// restored it (\x1b[?25h) yet.
-	if isMultiLineRedraw(b) {
+	// restored it (\x1b[?25h) yet, or has not yet written as many lines as it
+	// moved up.
+	if up := leadingCursorUpCount(b); up > 0 {
 		lastHide := bytes.LastIndex(b, []byte("\x1b[?25l"))
 		lastShow := bytes.LastIndex(b, []byte("\x1b[?25h"))
 		if lastHide >= 0 && lastShow < lastHide {
 			return true
 		}
-		if !bytes.HasSuffix(b, []byte("\x1b[?25h")) && !bytes.HasSuffix(b, []byte(syncUpdateEnd)) && len(b) >= 4096 {
-			return true
+		if !bytes.HasSuffix(b, []byte("\x1b[?25h")) && !bytes.HasSuffix(b, []byte(syncUpdateEnd)) {
+			if bytes.Count(b, []byte("\n")) < up || len(b) >= 4096 {
+				return true
+			}
 		}
 	}
 	return hasIncompleteTrailingSequence(b)
@@ -1816,15 +1872,16 @@ func hasIncompleteTrailingSequence(b []byte) bool {
 	return false
 }
 
-func isMultiLineRedraw(b []byte) bool {
-	if bytes.Contains(b, []byte("\x1b[J")) || bytes.Contains(b, []byte("\x1b[2J")) {
-		return true
-	}
+func leadingCursorUpCount(b []byte) int {
 	search := b
 	if len(search) > 64 {
 		search = search[:64]
 	}
-	return parseLeadingCursorUp(search) > 0
+	return parseLeadingCursorUp(search)
+}
+
+func isMultiLineRedraw(b []byte) bool {
+	return leadingCursorUpCount(b) > 0
 }
 
 func shouldWrapSyncOutput(b []byte) bool {
@@ -1842,7 +1899,10 @@ func makeRaw(fd int) (*term.State, error) {
 	return term.MakeRaw(fd)
 }
 
-const terminalStatusReset = "\x18\x1b]7501;state=clear\x07\x1b]21337;status=\x07\x1b]9;4;0\x07"
+const (
+	terminalStatusReset = "\x18\x1b]7501;state=clear\x07\x1b]21337;status=\x07\x1b]9;4;0\x07"
+	mouseTrackingReset  = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
+)
 
 func restoreTerm(fd int, state *term.State) {
 	_ = term.Restore(fd, state)
@@ -1863,20 +1923,133 @@ func sendWindowSize(w io.Writer) error {
 	return writeResizeFrame(w, height, width)
 }
 
-func sendWindowSizeBounce(w io.Writer) error {
+func sendWindowSizeBounce(w io.Writer, tracker *redrawTracker, stop <-chan struct{}) error {
 	width, height, err := term.GetSize(0)
 	if err != nil || width <= 0 || height <= 0 {
 		return nil
 	}
+	go runWindowSizeBounce(w, height, width, tracker, stop)
+	return nil
+}
+
+func runWindowSizeBounce(w io.Writer, height, width int, tracker *redrawTracker, stop <-chan struct{}) {
+	waitForInitialHistory(tracker, stop)
+	select {
+	case <-stop:
+		return
+	default:
+	}
+
+	baseClears, _, _ := tracker.snapshot()
 	bounceCols := int(bounceColumnCount(uint16(width)))
 	if err := writeResizeFrame(w, height, bounceCols); err != nil {
-		return err
+		return
 	}
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		_ = writeResizeFrame(w, height, width)
-	}()
-	return nil
+
+	// Wait for the child process to observe the bounced width and finish
+	// flushing any resulting full-screen redraw before restoring the real
+	// terminal width. Heavy sessions (~300 KB scrollback) can take 200-350ms
+	// to begin emitting \x1b[2J and ~150ms more to flush the stream.
+	sawPhase1 := waitForRedrawCycle(tracker, baseClears, 450*time.Millisecond, 35*time.Millisecond, 500*time.Millisecond, stop)
+	select {
+	case <-stop:
+		return
+	default:
+	}
+
+	phase2Base, _, _ := tracker.snapshot()
+	if err := writeResizeFrame(w, height, width); err != nil {
+		return
+	}
+
+	if sawPhase1 {
+		if !waitForRedrawCycle(tracker, phase2Base, 450*time.Millisecond, 35*time.Millisecond, 500*time.Millisecond, stop) {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = writeResizeFrame(w, height, bounceCols)
+			if !sleepOrStop(150*time.Millisecond, stop) {
+				return
+			}
+			_ = writeResizeFrame(w, height, width)
+		}
+	}
+}
+
+func waitForInitialHistory(tracker *redrawTracker, stop <-chan struct{}) {
+	if tracker == nil {
+		sleepOrStop(15*time.Millisecond, stop)
+		return
+	}
+	deadline := time.Now().Add(25 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, lastRead, _ := tracker.snapshot()
+		if !lastRead.IsZero() && time.Since(lastRead) >= 8*time.Millisecond {
+			return
+		}
+		if !sleepOrStop(5*time.Millisecond, stop) {
+			return
+		}
+	}
+}
+
+func waitForRedrawCycle(tracker *redrawTracker, baseClears int, clearWait, settleQuiet, maxSettle time.Duration, stop <-chan struct{}) bool {
+	if tracker == nil {
+		sleepOrStop(150*time.Millisecond, stop)
+		return false
+	}
+	clearDeadline := time.Now().Add(clearWait)
+	for {
+		clears, _, _ := tracker.snapshot()
+		if clears > baseClears {
+			break
+		}
+		rem := time.Until(clearDeadline)
+		if rem <= 0 {
+			return false
+		}
+		wait := min(rem, 15*time.Millisecond)
+		select {
+		case <-stop:
+			return false
+		case <-tracker.notify:
+		case <-time.After(wait):
+		}
+	}
+
+	settleDeadline := time.Now().Add(maxSettle)
+	for {
+		_, lastRead, settled := tracker.snapshot()
+		quietTarget := settleQuiet
+		if settled && quietTarget > 25*time.Millisecond {
+			quietTarget = 25 * time.Millisecond
+		}
+		if !lastRead.IsZero() && time.Since(lastRead) >= quietTarget {
+			return true
+		}
+		rem := time.Until(settleDeadline)
+		if rem <= 0 {
+			return true
+		}
+		wait := min(rem, 10*time.Millisecond)
+		select {
+		case <-stop:
+			return false
+		case <-tracker.notify:
+		case <-time.After(wait):
+		}
+	}
+}
+
+func sleepOrStop(d time.Duration, stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return false
+	case <-time.After(d):
+		return true
+	}
 }
 
 func writeResizeFrame(w io.Writer, rows, cols int) error {

@@ -642,3 +642,95 @@ func runServerAndRead(t *testing.T, command []string) []byte {
 	}
 	return output
 }
+
+func TestRunWindowSizeBounceWaitsForHeavyRedrawFlush(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	tracker := newRedrawTracker()
+	stop := make(chan struct{})
+	defer close(stop)
+
+	var dst bytes.Buffer
+	outputDone := make(chan struct{})
+	go func() {
+		forwardSessionOutputWithTracker(&dst, clientConn, tracker)
+		close(outputDone)
+	}()
+
+	type resizeEvent struct {
+		rows uint16
+		cols uint16
+		at   time.Time
+	}
+	var events []resizeEvent
+	serverDone := make(chan error, 1)
+	go func() {
+		defer close(serverDone)
+		// Initial history burst (no full screen clear).
+		_, _ = serverConn.Write([]byte("initial-viewport\r\n"))
+		for i := 0; i < 2; i++ {
+			typ, payload, err := readFrame(serverConn)
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			if typ != frameResize || len(payload) != 8 {
+				serverDone <- fmt.Errorf("unexpected frame %c len=%d", typ, len(payload))
+				return
+			}
+			rows := uint16(binary.BigEndian.Uint32(payload[:4]))
+			cols := uint16(binary.BigEndian.Uint32(payload[4:]))
+			events = append(events, resizeEvent{rows: rows, cols: cols, at: time.Now()})
+			// Simulate heavy agy render (~180ms CPU before \x1b[2J, 60ms stream flush).
+			time.Sleep(180 * time.Millisecond)
+			_, _ = serverConn.Write([]byte(fmt.Sprintf("\x1b[?25l\x1b[2J\x1b[Hscrollback-cols-%d\r\n", cols)))
+			time.Sleep(60 * time.Millisecond)
+			_, _ = serverConn.Write([]byte(fmt.Sprintf("viewport-cols-%d\x1b[?25h", cols)))
+		}
+		_ = serverConn.Close()
+	}()
+
+	runWindowSizeBounce(clientConn, 41, 94, tracker, stop)
+	if err := <-serverDone; err != nil {
+		t.Fatalf("server error: %v", err)
+	}
+	<-outputDone
+
+	if len(events) != 2 {
+		t.Fatalf("got %d resize events, want 2", len(events))
+	}
+	if events[0].rows != 41 || events[0].cols != 93 {
+		t.Fatalf("first resize = %dx%d, want 41x93", events[0].rows, events[0].cols)
+	}
+	if events[1].rows != 41 || events[1].cols != 94 {
+		t.Fatalf("second resize = %dx%d, want 41x94", events[1].rows, events[1].cols)
+	}
+	if gap := events[1].at.Sub(events[0].at); gap < 240*time.Millisecond {
+		t.Fatalf("second resize sent after %v, before first 240ms heavy redraw finished flushing", gap)
+	}
+	out := dst.String()
+	if !strings.Contains(out, "scrollback-cols-94") || !strings.Contains(out, "viewport-cols-94") {
+		t.Fatalf("restored width redraw missing from output: %q", out)
+	}
+}
+
+func TestTrimHistorySliceStartsAtLineBoundary(t *testing.T) {
+	raw := []byte("a52e824;file:///home/c/veloren/foo.rs\x07foo.rs\x1b]8;;\x07\r\nclean-line-start\r\n")
+	trimmed := string(trimHistorySlice(raw))
+	if trimmed != "clean-line-start\r\n" {
+		t.Fatalf("trimHistorySlice = %q, want %q", trimmed, "clean-line-start\r\n")
+	}
+}
+
+func TestFullScreenScrollbackDumpIsNotWrappedInSyncOutput(t *testing.T) {
+	dump := []byte("\x1b[?25l\x1b[2J\x1b[3J\x1b[Hline-1\r\n\x1b[Kline-2\r\n\x1b[J\x1b[?25h")
+	if shouldWrapSyncOutput(dump) {
+		t.Fatal("full-screen scrollback dump should not be wrapped in DEC 2026 synchronized output")
+	}
+	inPlace := []byte("\x1b[?25l\r\x1b[12A\x1b[Kline-1\r\n\x1b[J\x1b[?25h")
+	if !shouldWrapSyncOutput(inPlace) {
+		t.Fatal("in-place cursor-up redraw should be wrapped in DEC 2026 synchronized output")
+	}
+}
