@@ -260,6 +260,15 @@ func TestExtractSessionSummaryAndStatus(t *testing.T) {
 	if !strings.Contains(summary, "[Read]") || !strings.Contains(summary, "真正有价值的最近回复摘要") {
 		t.Fatalf("summary = %q, want tool name and latest conversation line", summary)
 	}
+
+	ompWorking := []byte("\x1b]7501;state=working:app=omp\x1b\\working line\r\n")
+	if st, _ := extractSessionSummary(ompWorking); st != "●" {
+		t.Fatalf("omp working status = %q, want ●", st)
+	}
+	ompDone := []byte("\x1b]7501;state=working:app=omp\x1b\\working line\r\n\x1b]7501;state=done:app=omp\x1b\\")
+	if st, _ := extractSessionSummary(ompDone); st != "○" {
+		t.Fatalf("omp done status = %q, want ○", st)
+	}
 }
 
 func TestRenderPreviewCollapsesPaddingAndPreservesConversation(t *testing.T) {

@@ -768,12 +768,7 @@ func extractSessionSummary(output []byte) (status string, summary string) {
 		output = trimHistorySlice(output[len(output)-maxInspectBytes:])
 	}
 	status = "○"
-	lastWorking := bytes.LastIndex(output, []byte("\x1b]7501;state=working\x07"))
-	lastDone := max(
-		bytes.LastIndex(output, []byte("\x1b]7501;state=done\x07")),
-		bytes.LastIndex(output, []byte("\x1b]7501;state=idle\x07")),
-	)
-	if lastWorking > lastDone {
+	if _, state := extractLastOSC7501(output); state == "working" {
 		status = "●"
 	}
 
@@ -1447,6 +1442,7 @@ type ptyServer struct {
 	master            *os.File
 	clients           map[net.Conn]struct{}
 	history           []byte
+	lastStatusSeq     []byte
 	hasRedrawTail     bool
 	lastRedrawOffset  int
 	lastRedrawDown    int
@@ -1477,6 +1473,11 @@ func (s *ptyServer) add(conn net.Conn) bool {
 	s.clients[conn] = struct{}{}
 	if len(s.history) > 0 {
 		_, _ = conn.Write(s.history)
+	}
+	if len(s.lastStatusSeq) > 0 {
+		if _, state := extractLastOSC7501(s.history); state == "" {
+			_, _ = conn.Write(s.lastStatusSeq)
+		}
 	}
 	return true
 }
@@ -1548,6 +1549,16 @@ func (s *ptyServer) broadcastPTY() {
 
 func (s *ptyServer) appendHistory(p []byte) {
 	const maxHistory = 512 << 10
+	if seq, state := extractLastOSC7501(p); state != "" {
+		switch state {
+		case "working", "blocked", "idle":
+			s.lastStatusSeq = append(s.lastStatusSeq[:0], seq...)
+		case "done":
+			s.lastStatusSeq = append(s.lastStatusSeq[:0], "\x1b]7501;state=idle\x07"...)
+		case "clear", "error":
+			s.lastStatusSeq = nil
+		}
+	}
 	p = normalizeScrollbackClear(p)
 	if idx := lastFullClearIndex(p); idx >= 0 {
 		s.history = nil
@@ -1668,6 +1679,50 @@ func lastFullClearIndex(p []byte) int {
 	idxAll := bytes.LastIndex(p, []byte(clearAllHome))
 	idxScreen := bytes.LastIndex(p, []byte(clearScreenHome))
 	return max(idxAll, idxScreen)
+}
+
+func extractLastOSC7501(b []byte) (seq []byte, state string) {
+	prefix := []byte("\x1b]7501;")
+	search := b
+	offset := 0
+	for {
+		idx := bytes.Index(search, prefix)
+		if idx < 0 {
+			break
+		}
+		start := offset + idx
+		rest := b[start+len(prefix):]
+		end := -1
+		termLen := 0
+		for i := 0; i < len(rest) && i < 256; i++ {
+			if rest[i] == 0x07 {
+				end = i
+				termLen = 1
+				break
+			}
+			if rest[i] == 0x1b && i+1 < len(rest) && rest[i+1] == '\\' {
+				end = i
+				termLen = 2
+				break
+			}
+		}
+		if end >= 0 {
+			body := string(rest[:end])
+			for _, field := range strings.Split(body, ":") {
+				if st, ok := strings.CutPrefix(field, "state="); ok && st != "" {
+					seq = b[start : start+len(prefix)+end+termLen]
+					state = st
+					break
+				}
+			}
+			offset = start + len(prefix) + end + termLen
+			search = b[offset:]
+		} else {
+			offset = start + len(prefix)
+			search = b[offset:]
+		}
+	}
+	return seq, state
 }
 
 // parseInPlaceRedrawFrame detects cursor-up viewport redraw frames (such as
