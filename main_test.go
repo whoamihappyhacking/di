@@ -746,7 +746,7 @@ func TestFullScreenScrollbackDumpIsNotWrappedInSyncOutput(t *testing.T) {
 
 func TestInPlaceCompactorStripsUnchangedTopLinesAndSkipsDuplicateFrames(t *testing.T) {
 	var c inPlaceCompactor
-	frame1 := []byte("\x1b[?25l\x1b[?7l\r\x1b[3Atop-0\r\x1b[K\ntop-1\r\x1b[K\nspin-1\r\x1b[K\nstatus-1\r\x1b[K\x1b[?7h\x1b[?25h")
+	frame1 := []byte("\x1b[?25l\x1b[?7l\r\x1b[3A\x1b[Jtop-0\r\ntop-1\r\nspin-1\r\nstatus-1\x1b[?7h\x1b[?25h")
 	out1, skip1 := c.compact(frame1)
 	if skip1 || !bytes.Equal(out1, frame1) {
 		t.Fatalf("first frame should pass through unchanged: skip=%v out=%q", skip1, out1)
@@ -759,7 +759,7 @@ func TestInPlaceCompactorStripsUnchangedTopLinesAndSkipsDuplicateFrames(t *testi
 	}
 
 	// Frame where top-0 and top-1 are unchanged, and only spin-2 + status-2 change.
-	frame2 := []byte("\x1b[?25l\x1b[?7l\r\x1b[3Atop-0\r\x1b[K\ntop-1\r\x1b[K\nspin-2\r\x1b[K\nstatus-2\r\x1b[K\x1b[?7h\x1b[?25h")
+	frame2 := []byte("\x1b[?25l\x1b[?7l\r\x1b[3A\x1b[Jtop-0\r\ntop-1\r\nspin-2\r\nstatus-2\x1b[?7h\x1b[?25h")
 	out2, skip2 := c.compact(frame2)
 	if skip2 {
 		t.Fatal("changed frame must not be skipped")
@@ -767,8 +767,11 @@ func TestInPlaceCompactorStripsUnchangedTopLinesAndSkipsDuplicateFrames(t *testi
 	if bytes.Contains(out2, []byte("top-0")) || bytes.Contains(out2, []byte("top-1")) {
 		t.Fatalf("compacted frame still contained unchanged top lines: %q", out2)
 	}
-	if !bytes.Contains(out2, []byte("\r\x1b[1Aspin-2\r\x1b[K\nstatus-2")) {
-		t.Fatalf("compacted frame did not adjust cursor-up count to 1: %q", out2)
+	if !bytes.Contains(out2, []byte("\r\x1b[1A\x1b[Jspin-2\r\nstatus-2")) {
+		t.Fatalf("compacted frame did not adjust cursor-up count to 1 with \\x1b[J clear: %q", out2)
+	}
+	if !shouldWrapSyncOutput(out2) {
+		t.Fatalf("compacted frame should still qualify for DEC 2026 synchronized output: %q", out2)
 	}
 
 	// Full clear resets compactor state.
@@ -776,30 +779,5 @@ func TestInPlaceCompactorStripsUnchangedTopLinesAndSkipsDuplicateFrames(t *testi
 	out3, skip3 := c.compact(frame2)
 	if skip3 || !bytes.Equal(out3, frame2) {
 		t.Fatalf("frame after full clear should not be diffed against pre-clear state: skip=%v out=%q", skip3, out3)
-	}
-}
-
-func TestRedrawTrackerSignalsCheckpointRefreshAfterSoftLimit(t *testing.T) {
-	tracker := newRedrawTracker()
-	tracker.observe([]byte("\x1b[2J\x1b[3J\x1b[Hinitial-scrollback"))
-	select {
-	case <-tracker.refreshCh:
-		t.Fatal("refreshCh should not fire immediately after clear")
-	default:
-	}
-
-	chunk := bytes.Repeat([]byte("x"), scrollbackRefreshSoftBytes)
-	tracker.observe(chunk)
-	select {
-	case <-tracker.refreshCh:
-	default:
-		t.Fatal("refreshCh should fire once bytesSinceClear reaches scrollbackRefreshSoftBytes")
-	}
-
-	// Subsequent clear resets bytesSinceClear.
-	tracker.observe([]byte("\x1b[2J\x1b[3J\x1b[Hrefreshed"))
-	bytesSince, _, _ := tracker.refreshStatus()
-	if bytesSince >= scrollbackRefreshSoftBytes {
-		t.Fatalf("bytesSinceClear was not reset by clear: %d", bytesSince)
 	}
 }

@@ -1299,8 +1299,7 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 	} else {
 		_ = sendWindowSize(conn)
 	}
-	go watchWindowSize(conn, stopWinch)
-	go watchScrollbackCheckpointRefresh(conn, tracker, stopWinch)
+	go watchWindowSizeWithTracker(conn, tracker, stopWinch)
 
 	type inputResult struct {
 		switchSession bool
@@ -1324,6 +1323,7 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 				if isMouseWheelInput(chunk) {
 					continue
 				}
+				tracker.resetCompactor()
 				if err := writeFrame(conn, frameInput, chunk); err != nil {
 					inputCh <- inputResult{err: err}
 					return
@@ -1781,16 +1781,22 @@ func parseLeadingCursorUpBounds(prefix []byte) (prefixEnd int, afterSeq int, up 
 // (\r\x1b[<N>A with N linefeeds) and strips unchanged top lines so 10 Hz
 // spinner updates only rewrite the bottom lines that actually changed.
 type inPlaceCompactor struct {
+	mu        sync.Mutex
 	prevUp    int
 	prevLines [][]byte
 }
 
 func (c *inPlaceCompactor) reset() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
 	c.prevUp = 0
 	c.prevLines = nil
+	c.mu.Unlock()
 }
 
-func (c *inPlaceCompactor) save(up int, lines [][]byte) {
+func (c *inPlaceCompactor) saveLocked(up int, lines [][]byte) {
 	c.prevUp = up
 	if cap(c.prevLines) < len(lines) {
 		c.prevLines = make([][]byte, len(lines))
@@ -1800,6 +1806,27 @@ func (c *inPlaceCompactor) save(up int, lines [][]byte) {
 	for i, line := range lines {
 		c.prevLines[i] = append(c.prevLines[i][:0], line...)
 	}
+}
+
+func hasVerticalCursorMotion(b []byte) bool {
+	for i := 0; i+2 < len(b); i++ {
+		if b[i] != 0x1b || b[i+1] != '[' {
+			continue
+		}
+		j := i + 2
+		for j < len(b) && (b[j] < 0x40 || b[j] > 0x7e) {
+			j++
+		}
+		if j >= len(b) {
+			break
+		}
+		switch b[j] {
+		case 'A', 'B', 'E', 'F', 'H', 'f', 'd', 'S', 'T', 'r':
+			return true
+		}
+		i = j
+	}
+	return false
 }
 
 func (c *inPlaceCompactor) compact(b []byte) (out []byte, skip bool) {
@@ -1816,7 +1843,7 @@ func (c *inPlaceCompactor) compact(b []byte) (out []byte, skip bool) {
 		search = search[:64]
 	}
 	prefixEnd, afterSeq, parsedUp, ok := parseLeadingCursorUpBounds(search)
-	if !ok || parsedUp != up {
+	if !ok || parsedUp != up || hasVerticalCursorMotion(b[afterSeq:]) {
 		c.reset()
 		return b, false
 	}
@@ -1825,8 +1852,11 @@ func (c *inPlaceCompactor) compact(b []byte) (out []byte, skip bool) {
 		c.reset()
 		return b, false
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.prevUp != up || len(c.prevLines) != len(lines) {
-		c.save(up, lines)
+		c.saveLocked(up, lines)
 		return b, false
 	}
 	firstDiff := len(lines)
@@ -1836,7 +1866,7 @@ func (c *inPlaceCompactor) compact(b []byte) (out []byte, skip bool) {
 			break
 		}
 	}
-	c.save(up, lines)
+	c.saveLocked(up, lines)
 	if firstDiff == len(lines) {
 		if !bytes.Contains(b[:prefixEnd], []byte("\x1b]")) {
 			return nil, true
@@ -1848,12 +1878,16 @@ func (c *inPlaceCompactor) compact(b []byte) (out []byte, skip bool) {
 	}
 	remUp := up - firstDiff
 	var buf bytes.Buffer
-	buf.Grow(prefixEnd + 16 + len(b[afterSeq:])/2)
+	buf.Grow(prefixEnd + 20 + len(b[afterSeq:])/2)
 	buf.Write(b[:prefixEnd])
 	buf.WriteString("\x1b[m\r")
 	if remUp > 0 {
 		fmt.Fprintf(&buf, "\x1b[%dA", remUp)
 	}
+	// Preserve \x1b[J (clear from first changed row to bottom of screen) so
+	// shorter status/spinner lines never leave trailing ghost characters and
+	// shouldWrapSyncOutput always wraps the frame in DEC 2026 sync markers.
+	buf.WriteString("\x1b[J")
 	for i := firstDiff; i < len(lines); i++ {
 		if i > firstDiff {
 			buf.WriteByte('\n')
@@ -1879,29 +1913,28 @@ func trimHistorySlice(b []byte) []byte {
 	return b
 }
 
-const (
-	scrollbackRefreshSoftBytes = 750 << 10
-	scrollbackRefreshHardBytes = 1150 << 10
-)
-
 type redrawTracker struct {
-	mu               sync.Mutex
-	notify           chan struct{}
-	refreshCh        chan struct{}
-	clearCount       int
-	lastReadTime     time.Time
-	lastClearTime    time.Time
-	redrawSettled    bool
-	seenInitialClear bool
-	bounceActive     bool
-	bytesSinceClear  int
+	mu            sync.Mutex
+	notify        chan struct{}
+	clearCount    int
+	lastReadTime  time.Time
+	lastClearTime time.Time
+	redrawSettled bool
+	bounceActive  bool
+	compactor     inPlaceCompactor
 }
 
 func newRedrawTracker() *redrawTracker {
 	return &redrawTracker{
-		notify:    make(chan struct{}, 1),
-		refreshCh: make(chan struct{}, 1),
+		notify: make(chan struct{}, 1),
 	}
+}
+
+func (t *redrawTracker) resetCompactor() {
+	if t == nil {
+		return
+	}
+	t.compactor.reset()
 }
 
 func (t *redrawTracker) observe(chunk []byte) {
@@ -1912,39 +1945,20 @@ func (t *redrawTracker) observe(chunk []byte) {
 	hasClear := bytes.Contains(chunk, []byte("\x1b[2J"))
 	hasCursorShow := bytes.Contains(chunk, []byte("\x1b[?25h"))
 
-	shouldRefresh := false
 	t.mu.Lock()
 	t.lastReadTime = now
 	if hasClear {
 		t.clearCount++
 		t.lastClearTime = now
 		t.redrawSettled = hasCursorShow
-		t.seenInitialClear = true
-		if idx := lastFullClearIndex(chunk); idx >= 0 {
-			t.bytesSinceClear = len(chunk) - idx
-		} else {
-			t.bytesSinceClear = len(chunk)
-		}
-	} else {
-		if t.clearCount > 0 && hasCursorShow {
-			t.redrawSettled = true
-		}
-		t.bytesSinceClear += len(chunk)
-		if t.seenInitialClear && !t.bounceActive && t.bytesSinceClear >= scrollbackRefreshSoftBytes {
-			shouldRefresh = true
-		}
+	} else if t.clearCount > 0 && hasCursorShow {
+		t.redrawSettled = true
 	}
 	t.mu.Unlock()
 
 	select {
 	case t.notify <- struct{}{}:
 	default:
-	}
-	if shouldRefresh {
-		select {
-		case t.refreshCh <- struct{}{}:
-		default:
-		}
 	}
 }
 
@@ -1979,15 +1993,6 @@ func (t *redrawTracker) finishBounce() {
 	t.mu.Unlock()
 }
 
-func (t *redrawTracker) refreshStatus() (bytesSince int, lastRead time.Time, bounceActive bool) {
-	if t == nil {
-		return 0, time.Time{}, false
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.bytesSinceClear, t.lastReadTime, t.bounceActive
-}
-
 func forwardSessionOutput(dst io.Writer, conn net.Conn) {
 	forwardSessionOutputWithTracker(dst, conn, nil)
 }
@@ -1996,7 +2001,11 @@ func forwardSessionOutputWithTracker(dst io.Writer, conn net.Conn, tracker *redr
 	const maxBatch = 64 << 10
 	buf := make([]byte, 32<<10)
 	batch := make([]byte, 0, maxBatch)
-	var compactor inPlaceCompactor
+	var localCompactor inPlaceCompactor
+	compactor := &localCompactor
+	if tracker != nil {
+		compactor = &tracker.compactor
+	}
 	for {
 		n, err := conn.Read(buf)
 		if n > 0 {
@@ -2214,42 +2223,6 @@ func runWindowSizeBounce(w io.Writer, height, width int, tracker *redrawTracker,
 	}
 }
 
-// watchScrollbackCheckpointRefresh ensures that outer terminal multiplexers
-// with fixed-size raw-history ring buffers (such as LightOS WebShell's 1.75 MB
-// raw-history fallback) always retain at least one full \x1b[2J\x1b[3J\x1b[H
-// scrollback dump within their replay window.
-func watchScrollbackCheckpointRefresh(w io.Writer, tracker *redrawTracker, stop <-chan struct{}) {
-	if tracker == nil {
-		return
-	}
-	for {
-		select {
-		case <-stop:
-			return
-		case <-tracker.refreshCh:
-		}
-		for {
-			bytesSince, lastRead, active := tracker.refreshStatus()
-			if active || bytesSince < scrollbackRefreshSoftBytes {
-				break
-			}
-			if bytesSince >= scrollbackRefreshHardBytes || (!lastRead.IsZero() && time.Since(lastRead) >= 250*time.Millisecond) {
-				width, height, err := term.GetSize(0)
-				if err == nil && width > 0 && height > 0 {
-					runWindowSizeBounce(w, height, width, tracker, stop)
-				}
-				if !sleepOrStop(500*time.Millisecond, stop) {
-					return
-				}
-				break
-			}
-			if !sleepOrStop(60*time.Millisecond, stop) {
-				return
-			}
-		}
-	}
-}
-
 func waitForInitialHistory(tracker *redrawTracker, stop <-chan struct{}) {
 	if tracker == nil {
 		sleepOrStop(15*time.Millisecond, stop)
@@ -2331,7 +2304,7 @@ func writeResizeFrame(w io.Writer, rows, cols int) error {
 	return writeFrame(w, frameResize, payload)
 }
 
-func watchWindowSize(w io.Writer, stop <-chan struct{}) {
+func watchWindowSizeWithTracker(w io.Writer, tracker *redrawTracker, stop <-chan struct{}) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
 	defer signal.Stop(ch)
@@ -2340,6 +2313,7 @@ func watchWindowSize(w io.Writer, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ch:
+			tracker.resetCompactor()
 			_ = sendWindowSize(w)
 		}
 	}
