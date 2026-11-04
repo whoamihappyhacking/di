@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1040,4 +1041,431 @@ func TestLightOSWebShellSameSizeSIGWINCHRepaintsFullScrollbackFromVTerm(t *testi
 	if !strings.Contains(repainted, "webshell-scroll-01") || !strings.Contains(repainted, "webshell-active-prompt") {
 		t.Fatalf("same-size WebShell reopen did not repaint full scrollback and screen: %q", repainted)
 	}
+
+	// Verify by replaying into an independent host terminal (simulating LightOS ghostty-vt.wasm)
+	// that all 10 scrollback rows actually scrolled off into native scrollback and were not overwritten by CUP!
+	hostVT := newVTerm(6, 40)
+	hostVT.Write(out.Bytes())
+	if hostVT.ScrollbackLen() != r.vt.ScrollbackLen() {
+		t.Fatalf("host native scrollback len = %d, want %d", hostVT.ScrollbackLen(), r.vt.ScrollbackLen())
+	}
+	for i := 0; i < 6; i++ {
+		if got, want := hostVT.ViewportRow(i).plainText(), r.vt.ViewportRow(i).plainText(); got != want {
+			t.Fatalf("host viewport row %d = %q, want %q", i, got, want)
+		}
+	}
 }
+
+func TestAstraP1AltScreenShrinkAndRestoreNoPanic(t *testing.T) {
+	vt := newVTerm(6, 8)
+	vt.Write([]byte("\x1b[6;8HX\x1b[?1049h"))
+	vt.Resize(2, 4)
+	// Returning from alternate screen after shrinking must clamp saved cursor and not panic.
+	vt.Write([]byte("\x1b[?1049lY\x1b[K"))
+	if vt.InAltScreen() {
+		t.Fatal("expected primary screen after ?1049l")
+	}
+	rows, cols := vt.Size()
+	if rows != 2 || cols != 4 {
+		t.Fatalf("size = %dx%d, want 2x4", rows, cols)
+	}
+
+	// Mode 47 retains alt screen content across exit and re-entry.
+	vt47 := newVTerm(4, 10)
+	vt47.Write([]byte("\x1b[?47h\x1b[1;1HALT47\x1b[?47l\x1b[?47h"))
+	if got := vt47.ViewportRow(0).plainText(); got != "ALT47" {
+		t.Fatalf("mode 47 did not retain alt screen content: got %q, want ALT47", got)
+	}
+
+	// Multi-parameter DECSET/DECRST applies subsequent params to the newly switched screen.
+	vtMulti := newVTerm(4, 10)
+	vtMulti.Write([]byte("\x1b[?1049h\x1b[?1049;25l"))
+	if vtMulti.InAltScreen() {
+		t.Fatal("expected primary screen after ?1049;25l")
+	}
+	if vtMulti.primary.cursorVis {
+		t.Fatal("expected primary cursorVis=false after ?1049;25l")
+	}
+}
+
+func TestAstraP1LargeCSIParamsNoOverflowOrCrash(t *testing.T) {
+	vt := newVTerm(6, 10)
+	vt.Write([]byte("\x1b[2;1H\x1b[9223372036854775807B\x1b[K"))
+	vt.Write([]byte("\x1b[9223372036854775807E\x1b[9223372036854775807C\x1b[9223372036854775807X"))
+	vt.Write([]byte("\x1b[9223372036854775807@\x1b[9223372036854775807P"))
+	if vt.primary.curR < 0 || vt.primary.curR >= 6 || vt.primary.curC < 0 || vt.primary.curC >= 10 {
+		t.Fatalf("cursor out of bounds after huge CSI params: (%d,%d)", vt.primary.curR, vt.primary.curC)
+	}
+
+	// CSI with intermediate (CSI 1 SP @) must not execute ICH.
+	vt2 := newVTerm(2, 6)
+	vt2.Write([]byte("ABCD\r\x1b[1 @"))
+	if got := vt2.ViewportRow(0).plainText(); got != "ABCD" {
+		t.Fatalf("CSI 1 SP @ falsely executed ICH: got %q, want ABCD", got)
+	}
+
+	// CAN (0x18) cancels an in-progress CSI sequence.
+	vt2.Write([]byte("\x1b[31\x18mZ"))
+	if vt2.primary.grid[0].cells[0].style.fg.kind != vtermColorDefault {
+		t.Fatal("CAN did not cancel in-progress CSI SGR sequence")
+	}
+}
+
+type yieldWriter struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (w *yieldWriter) Write(p []byte) (int, error) {
+	if len(p) > 2 {
+		w.mu.Lock()
+		w.buf.Write(p[:2])
+		w.mu.Unlock()
+		time.Sleep(time.Millisecond)
+		w.mu.Lock()
+		w.buf.Write(p[2:])
+		w.mu.Unlock()
+		return len(p), nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.Write(p)
+}
+
+func TestAstraP1ConcurrentWriteFrameAtomicity(t *testing.T) {
+	w := &yieldWriter{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 20; i++ {
+			_ = writeFrame(w, frameInput, []byte("hello-world"))
+		}
+	}()
+	for i := 0; i < 20; i++ {
+		_ = writeResizeFrame(w, 24+i, 80+i)
+	}
+	<-done
+
+	r := bytes.NewReader(w.buf.Bytes())
+	count := 0
+	for r.Len() > 0 {
+		typ, payload, err := readFrame(r)
+		if err != nil {
+			t.Fatalf("frame %d corrupted: %v", count, err)
+		}
+		switch typ {
+		case frameInput:
+			if string(payload) != "hello-world" {
+				t.Fatalf("input payload = %q, want hello-world", payload)
+			}
+		case frameResize:
+			if len(payload) != 8 {
+				t.Fatalf("resize payload len = %d, want 8", len(payload))
+			}
+		default:
+			t.Fatalf("unexpected frame type %q", typ)
+		}
+		count++
+	}
+	if count != 40 {
+		t.Fatalf("read %d frames, want 40", count)
+	}
+}
+
+func TestAstraP1BlitEncoderFullAndDiffNativeScrollbackFidelity(t *testing.T) {
+	var out bytes.Buffer
+	r := newClientSessionRenderer(&out, 3, 10, nil)
+	defer r.Close()
+	hostVT := newVTerm(3, 10)
+
+	// 1. Initial 3 rows: A, B, C
+	_ = r.ProcessChunk([]byte("A\r\nB\r\nC"))
+	hostVT.Write(out.Bytes())
+	out.Reset()
+
+	// 2. Push 3 rows at once (len(pushed) >= rows): D, E, F
+	_ = r.ProcessChunk([]byte("\r\nD\r\nE\r\nF"))
+	hostVT.Write(out.Bytes())
+	out.Reset()
+
+	if hostVT.ScrollbackLen() != 3 {
+		t.Fatalf("host scrollback len = %d, want 3", hostVT.ScrollbackLen())
+	}
+	wantSB := []string{"A", "B", "C"}
+	gotSB := hostVT.effectiveScrollback()
+	for i, w := range wantSB {
+		if got := gotSB[i].plainText(); got != w {
+			t.Fatalf("host scrollback[%d] = %q, want %q", i, got, w)
+		}
+	}
+	wantVP := []string{"D", "E", "F"}
+	for i, w := range wantVP {
+		if got := hostVT.ViewportRow(i).plainText(); got != w {
+			t.Fatalf("host viewport[%d] = %q, want %q", i, got, w)
+		}
+	}
+
+	// 3. Colored row followed by blank row in encodeFull must not bleed background color into row 2.
+	var out2 bytes.Buffer
+	r2 := newClientSessionRenderer(&out2, 2, 5, nil)
+	defer r2.Close()
+	_ = r2.ProcessChunk([]byte("\x1b[41mA\x1b[0m"))
+	hostVT2 := newVTerm(2, 5)
+	hostVT2.Write(out2.Bytes())
+	if hostVT2.primary.grid[1].cells[0].style.bg.kind != vtermColorDefault {
+		t.Fatalf("row 2 background bled from row 1: %+v", hostVT2.primary.grid[1].cells[0].style.bg)
+	}
+}
+
+func TestAstraP1SnapshotANSIPreservesAltScreenSGRMarginsAndNoDuplicateScrollback(t *testing.T) {
+	s := &ptyServer{
+		clients:     map[net.Conn]struct{}{},
+		clientReady: make(chan struct{}),
+		lastRows:    6,
+		lastCols:    40,
+	}
+	for i := 1; i <= 10; i++ {
+		s.appendHistory([]byte(fmt.Sprintf("hist-line-%02d\r\n", i)))
+	}
+	// Historical bell, valid OSC 52, and oversized OSC 52 (> 256 KB).
+	oversized := strings.Repeat("A", 300*1024)
+	s.appendHistory([]byte("\x07\x1b]52;c;aGVsbG8=\x07\x1b]52;c;" + oversized + "\x07"))
+	// Enter alt screen, set red fg, and clear screen (which truncates s.history).
+	s.appendHistory([]byte("\x1b[?1049h\x1b[31m\x1b[2J\x1b[Halt-red-text"))
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	var replay bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&replay, clientConn)
+		close(done)
+	}()
+
+	if !s.add(serverConn) {
+		t.Fatal("s.add rejected connection")
+	}
+	_ = serverConn.Close()
+	s.clientWG.Done()
+	<-done
+
+	if bytes.Contains(replay.Bytes(), []byte("\x1b]52;")) {
+		t.Fatal("reattach snapshot must not replay historical OSC 52 clipboard writes")
+	}
+
+	// Replay into a taller client (12x40) to verify snapshot geometry negotiation!
+	var clientOut bytes.Buffer
+	renderer := newClientSessionRenderer(&clientOut, 12, 40, nil)
+	defer renderer.Close()
+	if err := renderer.ProcessChunk(replay.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if !renderer.vt.InAltScreen() {
+		t.Fatal("reattached client did not restore alternate screen state")
+	}
+	if got := renderer.vt.ViewportRow(0).plainText(); got != "alt-red-text" {
+		t.Fatalf("alt screen row 0 = %q, want alt-red-text", got)
+	}
+	// Write one more char and verify active red SGR was preserved across snapshot!
+	_ = renderer.ProcessChunk([]byte("!"))
+	if renderer.vt.alt.grid[0].cells[12].style.fg.index != 1 {
+		t.Fatalf("active SGR color not preserved across snapshot: %+v", renderer.vt.alt.grid[0].cells[12].style.fg)
+	}
+	// Exit alt screen and verify primary scrollback has no duplicate lines.
+	_ = renderer.ProcessChunk([]byte("\x1b[?1049l"))
+	allLines := renderer.vt.DetectionLines(50)
+	count01 := 0
+	for _, l := range allLines {
+		if l == "hist-line-01" {
+			count01++
+		}
+	}
+	if count01 != 1 {
+		t.Fatalf("hist-line-01 appeared %d times, want 1 (lines=%v)", count01, allLines)
+	}
+}
+
+func TestAstraP1DEC2026SplitChunkSuppressesIntermediateRender(t *testing.T) {
+	var out bytes.Buffer
+	r := newClientSessionRenderer(&out, 4, 20, nil)
+	defer r.Close()
+
+	// Chunk 1 opens ?2026h without closing ?2026l.
+	if err := r.ProcessChunk([]byte("\x1b[?2026h\x1b[Hpartial-frame")); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("intermediate DEC 2026 chunk was rendered prematurely: %q", out.String())
+	}
+
+	// Chunk 2 completes the frame and closes ?2026l.
+	if err := r.ProcessChunk([]byte("\r\ncompleted-frame\x1b[?2026l")); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "completed-frame") {
+		t.Fatalf("completed DEC 2026 frame was not rendered: %q", out.String())
+	}
+}
+
+func TestAstraP1TerminalQueriesAndSplitDECRQM(t *testing.T) {
+	vt := newVTerm(10, 40)
+	// Split DECRQM ?2026$p across two Write calls, plus DSR 6n, DSR 5n, DA1, DA2, Kitty ?u.
+	vt.Write([]byte("\x1b[3;7H\x1b[?20"))
+	vt.Write([]byte("26$p\x1b[6n\x1b[5n\x1b[c\x1b[>c\x1b[>5u\x1b[?u"))
+	replies := string(vt.DrainReplies())
+	for _, want := range []string{
+		"\x1b[?2026;2$y",
+		"\x1b[3;7R",
+		"\x1b[0n",
+		"\x1b[?62;22c",
+		"\x1b[>1;10;0c",
+		"\x1b[?5u",
+	} {
+		if !strings.Contains(replies, want) {
+			t.Fatalf("replies %q missing %q", replies, want)
+		}
+	}
+}
+
+func TestAstraP2WideCharsICHDCHCombiningAndDECSpecialGraphics(t *testing.T) {
+	// 1. Combining mark attaches to base cell without advancing column.
+	vt := newVTerm(4, 10)
+	vt.Write([]byte("e\u0301X"))
+	if vt.primary.grid[0].cells[0].ch != 'e' || vt.primary.grid[0].cells[0].combining != "\u0301" {
+		t.Fatalf("combining mark not attached to 'e': %+v", vt.primary.grid[0].cells[0])
+	}
+	if vt.primary.grid[0].cells[1].ch != 'X' {
+		t.Fatalf("cell[1] = %q, want 'X'", vt.primary.grid[0].cells[1].ch)
+	}
+
+	// 2. ICH shifts wide character intact without clearing its continuation cell.
+	vtICH := newVTerm(2, 5)
+	vtICH.Write([]byte("界X\r\x1b[@"))
+	if got := vtICH.ViewportRow(0).plainText(); got != " 界X" {
+		t.Fatalf("ICH corrupted wide char: got %q, want %q", got, " 界X")
+	}
+
+	// 3. DCH shifts surviving wide character intact.
+	vtDCH := newVTerm(2, 6)
+	vtDCH.Write([]byte("a界b\r\x1b[P"))
+	if got := vtDCH.ViewportRow(0).plainText(); got != "界b" {
+		t.Fatalf("DCH corrupted surviving wide char: got %q, want %q", got, "界b")
+	}
+
+	// 4. Erasing half a wide glyph uses current erase background color for both halves.
+	vtBCE := newVTerm(2, 6)
+	vtBCE.Write([]byte("\x1b[41m界\x1b[44m\x1b[H\x1b[X"))
+	if vtBCE.primary.grid[0].cells[0].style.bg.index != 4 || vtBCE.primary.grid[0].cells[1].style.bg.index != 4 {
+		t.Fatalf("wide overlap did not use current erase bg (4): cell0=%+v cell1=%+v",
+			vtBCE.primary.grid[0].cells[0].style.bg, vtBCE.primary.grid[0].cells[1].style.bg)
+	}
+
+	// 5. Wide glyph at right margin with DECAWM disabled (?7l) is ignored rather than stored as width 1.
+	vtNoWrap := newVTerm(2, 5)
+	vtNoWrap.Write([]byte("\x1b[?7lAAAA界"))
+	if got := vtNoWrap.ViewportRow(0).plainText(); got != "AAAA" {
+		t.Fatalf("DECAWM off wide char at margin = %q, want AAAA", got)
+	}
+
+	// 6. DEC Special Graphics line drawing.
+	vtACS := newVTerm(2, 10)
+	vtACS.Write([]byte("\x1b(0lqk\x1b(B"))
+	if got := vtACS.ViewportRow(0).plainText(); got != "┌─┐" {
+		t.Fatalf("DEC Special Graphics = %q, want ┌─┐", got)
+	}
+
+	// 7. Soft-wrap horizontal resize reflow preserves logical text across shrink and widen.
+	vtReflow := newVTerm(4, 8)
+	vtReflow.Write([]byte("abcdefgh"))
+	vtReflow.Resize(4, 4)
+	if vtReflow.ViewportRow(0).plainText() != "abcd" || vtReflow.ViewportRow(1).plainText() != "efgh" {
+		t.Fatalf("shrunk rows = %q / %q, want abcd / efgh", vtReflow.ViewportRow(0).plainText(), vtReflow.ViewportRow(1).plainText())
+	}
+	vtReflow.Resize(4, 8)
+	if got := vtReflow.ViewportRow(0).plainText(); got != "abcdefgh" {
+		t.Fatalf("widened row = %q, want abcdefgh", got)
+	}
+}
+
+func TestAstraP2MouseWheelAndPageUpRoutingInAltScreenAndMouseMode(t *testing.T) {
+	var out bytes.Buffer
+	r := newClientSessionRenderer(&out, 6, 40, nil)
+	defer r.Close()
+
+	for i := 1; i <= 15; i++ {
+		_ = r.ProcessChunk([]byte(fmt.Sprintf("line-%02d\r\n", i)))
+	}
+
+	// Primary screen without mouse mode: wheel and PageUp are consumed locally.
+	if !r.HandleInput([]byte("\x1b[<64;10;5M")) {
+		t.Fatal("wheel up should be consumed on primary screen when mouse tracking is off")
+	}
+	_ = r.HandleInput([]byte("a")) // reset scrollback
+
+	// Enable mouse tracking (?1000h): wheel should be forwarded to child app unless Shift is held.
+	_ = r.ProcessChunk([]byte("\x1b[?1000h"))
+	if r.HandleInput([]byte("\x1b[<64;10;5M")) {
+		t.Fatal("wheel up should be forwarded to child app when ?1000h mouse tracking is enabled")
+	}
+	if !r.HandleInput([]byte("\x1b[<68;10;5M")) { // cb=64|4 (Shift+WheelUp)
+		t.Fatal("Shift+WheelUp should still scroll local scrollback")
+	}
+	_ = r.HandleInput([]byte("a"))
+
+	// Enter alternate screen (?1049h): both wheel and PageUp must be forwarded to child app (vim/htop).
+	_ = r.ProcessChunk([]byte("\x1b[?1049h"))
+	if r.HandleInput([]byte("\x1b[<64;10;5M")) {
+		t.Fatal("wheel up must be forwarded in alternate screen")
+	}
+	if r.HandleInput([]byte("\x1b[5~")) {
+		t.Fatal("PageUp must be forwarded in alternate screen")
+	}
+}
+
+func TestHeldKeyRepeatZeroLagAndKittyKeyboardStack(t *testing.T) {
+	var out bytes.Buffer
+	var replies bytes.Buffer
+	r := newClientSessionRenderer(&out, 10, 40, nil)
+	r.SetReplyWriter(func(b []byte) {
+		replies.Write(b)
+	})
+	defer r.Close()
+
+	// 1. Initial full frame in legacy keyboard mode must NOT emit \x1b[=0;1u or \x1b[<1u or \x1b[>4;0m.
+	_ = r.ProcessChunk([]byte("ready"))
+	initialOut := out.String()
+	if strings.Contains(initialOut, "\x1b[=0;1u") || strings.Contains(initialOut, "\x1b[<1u") || strings.Contains(initialOut, "\x1b[>4;0m") {
+		t.Fatalf("legacy keyboard mode should not emit kitty/modifyOtherKeys reset on initial frame: %q", initialOut)
+	}
+
+	// 2. Legacy server query fallback: ?u and 6n are answered by client mirror when server did not send snap=end.
+	_ = r.ProcessChunk([]byte("\x1b[>3u\x1b[?u\x1b[6n"))
+	if !strings.Contains(replies.String(), "\x1b[?3u") || !strings.Contains(replies.String(), "\x1b[1;6R") {
+		t.Fatalf("legacy server query fallback failed, got replies: %q", replies.String())
+	}
+	if !strings.Contains(out.String(), "\x1b[>3u") {
+		t.Fatalf("expected BlitEncoder to push \\x1b[>3u, got: %q", out.String())
+	}
+
+	// 3. Updating Kitty keyboard flags replaces the single host stack entry (\x1b[<1u\x1b[>15u).
+	out.Reset()
+	_ = r.ProcessChunk([]byte("\x1b[=15;1u"))
+	if !strings.Contains(out.String(), "\x1b[<1u\x1b[>15u") {
+		t.Fatalf("expected Kitty stack replacement \\x1b[<1u\\x1b[>15u, got: %q", out.String())
+	}
+
+	// 4. Held-key repeat across rows/columns settles with 0ms lag on every repeat.
+	for step := 1; step <= 8; step++ {
+		out.Reset()
+		_ = r.HandleInput([]byte("j"))
+		_ = r.ProcessChunk([]byte(fmt.Sprintf("\x1b[%d;%dH", step+1, step*3)))
+		wantCUP := fmt.Sprintf("\x1b[%d;%dH", step+1, step*3)
+		if !strings.Contains(out.String(), wantCUP) {
+			t.Fatalf("step %d: held-key repeat cursor move %q was throttled: %q", step, wantCUP, out.String())
+		}
+	}
+}
+
+
