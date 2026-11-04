@@ -781,3 +781,263 @@ func TestInPlaceCompactorStripsUnchangedTopLinesAndSkipsDuplicateFrames(t *testi
 		t.Fatalf("frame after full clear should not be diffed against pre-clear state: skip=%v out=%q", skip3, out3)
 	}
 }
+
+func TestVTermAndBlitEncoderDiffsInPlaceSpinnerWithoutFlickerOrClears(t *testing.T) {
+	var out bytes.Buffer
+	r := newClientSessionRenderer(&out, 10, 60, nil)
+	defer r.Close()
+
+	// Push 25 lines into scrollback + 10 lines on screen.
+	var initBuf bytes.Buffer
+	for i := 1; i <= 35; i++ {
+		fmt.Fprintf(&initBuf, "history-line-%02d\r\n", i)
+	}
+	if err := r.ProcessChunk(initBuf.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if r.vt.ScrollbackLen() < 25 {
+		t.Fatalf("scrollback len = %d, want >= 25", r.vt.ScrollbackLen())
+	}
+
+	// Simulate an agy-style 9-line in-place redraw frame.
+	buildFrame := func(tick int) []byte {
+		var b bytes.Buffer
+		b.WriteString("\x1b[?25l\r\x1b[8A\x1b[J")
+		for i := 1; i <= 7; i++ {
+			fmt.Fprintf(&b, "conversation-row-%d\r\n", i)
+		}
+		fmt.Fprintf(&b, "⠋ Running tool tick-%d\r\n", tick)
+		b.WriteString("? for shortcuts\x1b[?25h")
+		return b.Bytes()
+	}
+
+	if err := r.ProcessChunk(buildFrame(1)); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+
+	// Exact duplicate redraw must emit 0 bytes to the terminal.
+	if err := r.ProcessChunk(buildFrame(1)); err != nil {
+		t.Fatal(err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("duplicate redraw emitted %d bytes, want 0: %q", out.Len(), out.String())
+	}
+
+	// Next spinner tick only changes "tick-1" -> "tick-2" (1 character!).
+	if err := r.ProcessChunk(buildFrame(2)); err != nil {
+		t.Fatal(err)
+	}
+	diff := out.String()
+	if !strings.HasPrefix(diff, "\x1b[?2026h") || !strings.Contains(diff, "\x1b[?2026l") {
+		t.Fatalf("diff update not wrapped in DEC 2026 sync markers: %q", diff)
+	}
+	if strings.Contains(diff, "\x1b[2J") || strings.Contains(diff, "\x1b[3J") {
+		t.Fatalf("diff update must not clear screen or scrollback: %q", diff)
+	}
+	if strings.Contains(diff, "conversation-row-1") {
+		t.Fatalf("diff update re-emitted unchanged conversation rows: %q", diff)
+	}
+	if r.vt.ScrollbackLen() < 25 {
+		t.Fatalf("scrollback lost after in-place spinner redraws: got %d", r.vt.ScrollbackLen())
+	}
+}
+
+func TestVTermPreservesScrollbackAcrossBare3JAndReplacesOnFullDump(t *testing.T) {
+	vt := newVTerm(6, 40)
+	for i := 1; i <= 20; i++ {
+		vt.Write([]byte(fmt.Sprintf("scroll-row-%02d\r\n", i)))
+	}
+	initialSB := vt.ScrollbackLen()
+	if initialSB < 14 {
+		t.Fatalf("initial scrollback = %d, want >= 14", initialSB)
+	}
+
+	// 1. Bare \x1b[2J\x1b[3J\x1b[H followed by only a 3-line screen (no history re-dump).
+	vt.Write([]byte("\x1b[?25l\x1b[2J\x1b[3J\x1b[Hscreen-only-1\r\nscreen-only-2\x1b[?25h"))
+	if vt.ScrollbackLen() < initialSB {
+		t.Fatalf("bare \\x1b[3J destroyed scrollback: got %d, want >= %d", vt.ScrollbackLen(), initialSB)
+	}
+
+	// 2. Full history re-dump on resize (\x1b[2J\x1b[3J\x1b[H + 20 fresh lines).
+	var dump bytes.Buffer
+	dump.WriteString("\x1b[?25l\x1b[2J\x1b[3J\x1b[H")
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&dump, "rewrapped-row-%02d\r\n", i)
+	}
+	dump.WriteString("\x1b[?25h")
+	vt.Write(dump.Bytes())
+
+	if !vt.ConsumeFullScrollbackReplaced() {
+		t.Fatal("expected fullScrollbackReplaced=true after full history dump")
+	}
+	lines := vt.DetectionLines(50)
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "rewrapped-row-01") {
+		t.Fatalf("missing rewrapped scrollback after full dump: %q", joined)
+	}
+	if strings.Contains(joined, "scroll-row-01") {
+		t.Fatalf("old scrollback was duplicated after full dump: %q", joined)
+	}
+}
+
+func TestVTermRecoversScrolledOffLinesFromInPlaceSlidingWindowRedraw(t *testing.T) {
+	vt := newVTerm(6, 40)
+	vt.Write([]byte("\x1b[Hline-A\r\nline-B\r\nline-C\r\nline-D\r\nline-E\r\nline-F"))
+	if vt.ScrollbackLen() != 0 {
+		t.Fatalf("expected 0 initial scrollback, got %d", vt.ScrollbackLen())
+	}
+
+	// Shift content up by 2 lines in-place using \x1b[H without bottom linefeeds.
+	vt.Write([]byte("\x1b[H\x1b[2Kline-C\r\n\x1b[2Kline-D\r\n\x1b[2Kline-E\r\n\x1b[2Kline-F\r\n\x1b[2Kline-G\r\n\x1b[2Kline-H"))
+	if vt.ScrollbackLen() != 2 {
+		t.Fatalf("sliding window scrollback len = %d, want 2", vt.ScrollbackLen())
+	}
+	all := strings.Join(vt.DetectionLines(20), "\n")
+	if !strings.Contains(all, "line-A") || !strings.Contains(all, "line-B") {
+		t.Fatalf("scrolled-off top lines were not recovered into scrollback: %q", all)
+	}
+}
+
+func TestVTermWideCJKOverwriteAndScrollbarOverlay(t *testing.T) {
+	var out bytes.Buffer
+	r := newClientSessionRenderer(&out, 6, 20, nil)
+	defer r.Close()
+
+	for i := 1; i <= 15; i++ {
+		_ = r.ProcessChunk([]byte(fmt.Sprintf("历史记录第%02d行\r\n", i)))
+	}
+	// Overwrite second column of wide character '历' at row 0 col 0 with ASCII 'X'.
+	_ = r.ProcessChunk([]byte("\x1b[1;2HX"))
+	row0 := r.vt.ViewportRow(0).plainText()
+	if !strings.HasPrefix(row0, " X史记录") {
+		t.Fatalf("wide character orphan half was not cleared on overwrite: %q", row0)
+	}
+
+	out.Reset()
+	// Press PageUp (\x1b[5~) to scroll back into history.
+	if !r.HandleInput([]byte("\x1b[5~")) {
+		t.Fatal("PageUp should be consumed by scrollback viewport")
+	}
+	if !r.vt.IsScrolledBack() {
+		t.Fatal("vterm should be in scrolled-back state after PageUp")
+	}
+	scrolledOut := out.String()
+	if !strings.ContainsRune(scrolledOut, scrollbarTrackChar) && !strings.ContainsRune(scrolledOut, scrollbarThumbChar) {
+		t.Fatalf("scrolled view did not render herdr scrollbar characters: %q", scrolledOut)
+	}
+
+	// Normal keystroke snaps scrollback back to 0 and is not consumed.
+	if r.HandleInput([]byte("a")) {
+		t.Fatal("normal keystroke should be forwarded to session")
+	}
+	if r.vt.IsScrolledBack() {
+		t.Fatal("normal keystroke should reset scrollOffset to 0")
+	}
+}
+
+func TestCursorSettleDebouncesTransientJumpsAndHides(t *testing.T) {
+	cs := newCursorSettleState()
+	t0 := time.Now()
+
+	// Initial position settles immediately at preferredRow=5, col=10.
+	r, c, vis := cs.Observe(5, 10, true, t0)
+	if r != 5 || c != 10 || !vis {
+		t.Fatalf("initial settle = (%d,%d,%v), want (5,10,true)", r, c, vis)
+	}
+
+	// Transient cursor hide (\x1b[?25l) during redraw is held visible for 100ms.
+	_, _, vis = cs.Observe(0, 0, false, t0.Add(5*time.Millisecond))
+	if !vis {
+		t.Fatal("transient cursor hide should be held visible during redraw")
+	}
+
+	// Transient jump to row 1 during redraw holds settled position (5, 10).
+	r, c, vis = cs.Observe(1, 2, true, t0.Add(10*time.Millisecond))
+	if r != 5 || c != 10 || !vis {
+		t.Fatalf("transient row jump = (%d,%d,%v), want held (5,10,true)", r, c, vis)
+	}
+
+	// After 100ms hold deadline expires, cursor advances to (1, 2).
+	if !cs.Advance(t0.Add(120 * time.Millisecond)) {
+		t.Fatal("expected CursorSettleState.Advance to report change after deadline")
+	}
+	r, c, vis = cs.Observe(1, 2, true, t0.Add(120*time.Millisecond))
+	if r != 1 || c != 2 || !vis {
+		t.Fatalf("post-deadline settle = (%d,%d,%v), want (1,2,true)", r, c, vis)
+	}
+}
+
+func TestPTYServerPreservesScrollbackAcrossFullClearsOnReattach(t *testing.T) {
+	s := &ptyServer{
+		clients:     map[net.Conn]struct{}{},
+		clientReady: make(chan struct{}),
+		lastRows:    6,
+		lastCols:    40,
+	}
+	for i := 1; i <= 15; i++ {
+		s.appendHistory([]byte(fmt.Sprintf("pre-clear-scroll-%02d\r\n", i)))
+	}
+	// Full screen clear wipes s.history, but s.vt retains all scrollback lines!
+	s.appendHistory([]byte("\x1b[2J\x1b[Hpost-clear-screen-line"))
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	var replay bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&replay, clientConn)
+		close(done)
+	}()
+
+	if !s.add(serverConn) {
+		t.Fatal("s.add rejected connection")
+	}
+	_ = serverConn.Close()
+	s.clientWG.Done()
+	<-done
+
+	var clientOut bytes.Buffer
+	renderer := newClientSessionRenderer(&clientOut, 6, 40, nil)
+	defer renderer.Close()
+	if err := renderer.ProcessChunk(replay.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if !renderer.HasServerScrollback() {
+		t.Fatal("client renderer did not detect server vterm scrollback")
+	}
+	lines := strings.Join(renderer.vt.DetectionLines(30), "\n")
+	if !strings.Contains(lines, "pre-clear-scroll-01") || !strings.Contains(lines, "post-clear-screen-line") {
+		t.Fatalf("reattached client missing pre-clear scrollback or post-clear screen: %q", lines)
+	}
+}
+
+func TestLightOSWebShellSameSizeSIGWINCHRepaintsFullScrollbackFromVTerm(t *testing.T) {
+	var out bytes.Buffer
+	r := newClientSessionRenderer(&out, 6, 40, nil)
+	defer r.Close()
+
+	for i := 1; i <= 15; i++ {
+		_ = r.ProcessChunk([]byte(fmt.Sprintf("webshell-scroll-%02d\r\n", i)))
+	}
+	_ = r.ProcessChunk([]byte("webshell-active-prompt"))
+	out.Reset()
+
+	// Simulate LightOS WebShell reopen with identical 6x40 dimensions.
+	sizeChanged, hasScrollback, err := r.ResizeAndRepaint(6, 40)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizeChanged {
+		t.Fatal("expected sizeChanged=false for identical 6x40 dimensions")
+	}
+	if !hasScrollback {
+		t.Fatal("expected hasScrollback=true")
+	}
+	repainted := out.String()
+	if !strings.Contains(repainted, "webshell-scroll-01") || !strings.Contains(repainted, "webshell-active-prompt") {
+		t.Fatalf("same-size WebShell reopen did not repaint full scrollback and screen: %q", repainted)
+	}
+}

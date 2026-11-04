@@ -23,7 +23,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/creack/pty"
-	"github.com/hinshun/vt10x"
 	"golang.org/x/term"
 )
 
@@ -430,18 +429,16 @@ func renderPreview(output []byte, cols, rows int) []byte {
 	if len(output) > maxPreviewBytes {
 		output = trimHistorySlice(output[len(output)-maxPreviewBytes:])
 	}
-	output = normalizeForVT10x(output)
+	output = normalizeInkClear(output)
 	// Replay into a virtual terminal using the session's native rendered width
 	// and a tall row count so relative cursor-up redraws (\r\x1b[<N>A) do not
 	// wrap out of sync or scroll conversation text off the top of the screen.
 	vtCols := detectNativeCols(output, cols)
 	vtRows := max(rows*4, 120)
-	terminal := vt10x.New(vt10x.WithSize(vtCols, vtRows))
-	if _, err := terminal.Write(output); err != nil {
-		return nil
-	}
+	terminal := newVTerm(vtRows, vtCols)
+	terminal.Write(output)
 
-	rawLines := strings.Split(terminal.String(), "\n")
+	rawLines := terminal.ScreenPlainLines()
 	cleaned := cleanRenderedLines(rawLines, cols)
 	if len(cleaned) == 0 {
 		return nil
@@ -452,16 +449,12 @@ func renderPreview(output []byte, cols, rows int) []byte {
 	return []byte(strings.Join(cleaned, "\n") + "\n")
 }
 
-// normalizeForVT10x adapts modern TUI differential rendering sequences (such
-// as Claude Code's Ink CHA \x1b[<col>G space-skipping and \x1b[H\x1b[2K screen
-// clears) for vt10x, which uses 1 cell per rune regardless of CJK display width.
-func normalizeForVT10x(output []byte) []byte {
-	// If the output contains an Ink full-screen clear (\x1b[H\x1b[2K\x1b[1B\x1b[2K),
-	// discard stale frames prior to the last clear and replace with \x1b[2J\x1b[H.
+// normalizeInkClear collapses Ink full-screen clear sequences (\x1b[H\x1b[2K\x1b[1B\x1b[2K)
+// into a standard \x1b[2J\x1b[H clear.
+func normalizeInkClear(output []byte) []byte {
 	inkClear := []byte("\x1b[H\x1b[2K\x1b[1B\x1b[2K")
 	if idx := bytes.LastIndex(output, inkClear); idx >= 0 {
 		rest := output[idx:]
-		// Skip the entire run of \x1b[H / \x1b[2K / \x1b[1B clear commands.
 		j := 0
 		for j < len(rest) {
 			if bytes.HasPrefix(rest[j:], []byte("\x1b[H")) {
@@ -474,85 +467,7 @@ func normalizeForVT10x(output []byte) []byte {
 		}
 		output = append([]byte(clearScreenHome), rest[j:]...)
 	}
-
-	var out bytes.Buffer
-	out.Grow(len(output))
-	col := 1
-	for i := 0; i < len(output); {
-		b := output[i]
-		if b == '\r' || b == '\n' {
-			col = 1
-			out.WriteByte(b)
-			i++
-			continue
-		}
-		if b == 0x1b && i+1 < len(output) {
-			if output[i+1] == '[' {
-				j := i + 2
-				for j < len(output) && (output[j] < 0x40 || output[j] > 0x7e) {
-					j++
-				}
-				if j < len(output) {
-					final := output[j]
-					params := output[i+2 : j]
-					if final == 'G' {
-						targetCol, err := strconv.Atoi(string(params))
-						if err == nil && targetCol >= 1 {
-							if targetCol >= col {
-								spaces := targetCol - col
-								if spaces > 0 {
-									out.WriteString(strings.Repeat(" ", spaces))
-								}
-								col = targetCol
-								i = j + 1
-								continue
-							}
-						}
-					} else if final == 'H' || final == 'f' || final == 'J' || final == 'K' {
-						col = 1
-					} else if final == 'C' {
-						n, err := strconv.Atoi(string(params))
-						if err != nil || n <= 0 {
-							n = 1
-						}
-						col += n
-					}
-					out.Write(output[i : j+1])
-					i = j + 1
-					continue
-				}
-			} else if output[i+1] == ']' {
-				// OSC sequence ending with BEL (0x07) or ST (\x1b\\).
-				j := i + 2
-				for j < len(output) {
-					if output[j] == 0x07 {
-						j++
-						break
-					}
-					if output[j] == 0x1b && j+1 < len(output) && output[j+1] == '\\' {
-						j += 2
-						break
-					}
-					j++
-				}
-				out.Write(output[i:j])
-				i = j
-				continue
-			}
-		}
-		r, size := utf8.DecodeRune(output[i:])
-		if r == utf8.RuneError && size == 1 {
-			out.WriteByte(output[i])
-			i++
-			continue
-		}
-		if r >= 0x20 {
-			col += singleRuneWidth(r)
-		}
-		out.Write(output[i : i+size])
-		i += size
-	}
-	return out.Bytes()
+	return output
 }
 
 // detectNativeCols infers the PTY column width at which the latest screen in
@@ -772,13 +687,11 @@ func extractSessionSummary(output []byte) (status string, summary string) {
 		status = "●"
 	}
 
-	output = normalizeForVT10x(output)
+	output = normalizeInkClear(output)
 	vtCols := detectNativeCols(output, 100)
-	terminal := vt10x.New(vt10x.WithSize(vtCols, 120))
-	if _, err := terminal.Write(output); err != nil {
-		return status, ""
-	}
-	rawLines := strings.Split(terminal.String(), "\n")
+	terminal := newVTerm(120, vtCols)
+	terminal.Write(output)
+	rawLines := terminal.DetectionLines(120)
 	var activeTool string
 	var substantive []string
 	for i := len(rawLines) - 1; i >= 0; i-- {
@@ -1279,10 +1192,14 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 		fmt.Print(mouseTrackingReset)
 	}
 
+	initCols, initRows := terminalSize()
 	tracker := newRedrawTracker()
+	renderer := newClientSessionRenderer(os.Stdout, initRows, initCols, tracker)
+	defer renderer.Close()
+
 	done := make(chan struct{})
 	go func() {
-		forwardSessionOutputWithTracker(os.Stdout, conn, tracker)
+		forwardSessionOutputWithRenderer(os.Stdout, conn, tracker, renderer)
 		close(done)
 	}()
 	// Stop and drain forwarded output before restoring terminal state. Otherwise
@@ -1295,11 +1212,11 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 	stopWinch := make(chan struct{})
 	defer close(stopWinch)
 	if reattach {
-		_ = sendWindowSizeBounce(conn, tracker, stopWinch)
+		_ = sendWindowSizeSmartReattach(conn, tracker, renderer, stopWinch)
 	} else {
 		_ = sendWindowSize(conn)
 	}
-	go watchWindowSizeWithTracker(conn, tracker, stopWinch)
+	go watchWindowSizeWithRenderer(conn, tracker, renderer, stopWinch)
 
 	type inputResult struct {
 		switchSession bool
@@ -1320,7 +1237,7 @@ func attachOnce(sock string, reattach bool) (bool, error) {
 					inputCh <- inputResult{switchSession: true}
 					return
 				}
-				if isMouseWheelInput(chunk) {
+				if renderer.HandleInput(chunk) {
 					continue
 				}
 				tracker.resetCompactor()
@@ -1441,7 +1358,9 @@ type ptyServer struct {
 	mu                sync.Mutex
 	master            *os.File
 	clients           map[net.Conn]struct{}
+	vt                *vterm
 	history           []byte
+	historyTruncated  bool
 	lastStatusSeq     []byte
 	hasRedrawTail     bool
 	lastRedrawOffset  int
@@ -1454,6 +1373,20 @@ type ptyServer struct {
 	clientReady       chan struct{}
 	clientWG          sync.WaitGroup
 	closing           bool
+}
+
+func (s *ptyServer) ensureVTermLocked() *vterm {
+	if s.vt == nil {
+		rows, cols := int(s.lastRows), int(s.lastCols)
+		if rows <= 0 {
+			rows = defaultVTermRows
+		}
+		if cols <= 0 {
+			cols = defaultVTermCols
+		}
+		s.vt = newVTerm(rows, cols)
+	}
+	return s.vt
 }
 
 func (s *ptyServer) markClientReady() {
@@ -1471,8 +1404,17 @@ func (s *ptyServer) add(conn net.Conn) bool {
 	}
 	s.clientWG.Add(1)
 	s.clients[conn] = struct{}{}
-	if len(s.history) > 0 {
-		_, _ = conn.Write(s.history)
+	hist := s.history
+	if s.vt != nil && s.vt.ScrollbackLen() > 0 {
+		if s.historyTruncated {
+			_, _ = conn.Write(s.vt.ScrollbackHeaderANSI())
+			hist = bytes.TrimPrefix(hist, []byte(clearAllHome))
+		} else {
+			_, _ = conn.Write([]byte("\x1b]7502;vterm=1\x07"))
+		}
+	}
+	if len(hist) > 0 {
+		_, _ = conn.Write(hist)
 	}
 	if len(s.lastStatusSeq) > 0 {
 		if _, state := extractLastOSC7501(s.history); state == "" {
@@ -1549,6 +1491,7 @@ func (s *ptyServer) broadcastPTY() {
 
 func (s *ptyServer) appendHistory(p []byte) {
 	const maxHistory = 512 << 10
+	s.ensureVTermLocked().Write(p)
 	if seq, state := extractLastOSC7501(p); state != "" {
 		switch state {
 		case "working", "blocked", "idle":
@@ -1562,6 +1505,7 @@ func (s *ptyServer) appendHistory(p []byte) {
 	p = normalizeScrollbackClear(p)
 	if idx := lastFullClearIndex(p); idx >= 0 {
 		s.history = nil
+		s.historyTruncated = true
 		s.hasRedrawTail = false
 		s.lastRedrawOffset = 0
 		s.lastRedrawDown = 0
@@ -1584,6 +1528,7 @@ func (s *ptyServer) appendHistory(p []byte) {
 	if len(s.history) > maxHistory {
 		trimmed := trimHistorySlice(s.history[len(s.history)-maxHistory:])
 		s.history = append([]byte(nil), trimmed...)
+		s.historyTruncated = true
 		s.hasRedrawTail = false
 	}
 }
@@ -1620,6 +1565,7 @@ func (s *ptyServer) applyResize(rows, cols uint16, firstForConn bool) {
 		return
 	}
 	s.mu.Lock()
+	s.ensureVTermLocked().Resize(int(rows), int(cols))
 	shouldBounce := firstForConn && s.initialResizeDone && s.lastRows == rows && s.lastCols == cols
 	s.initialResizeDone = true
 	s.resizeSeq++
@@ -1646,6 +1592,7 @@ func (s *ptyServer) applyResize(rows, cols uint16, firstForConn bool) {
 		}
 		s.lastRows = rows
 		s.lastCols = cols
+		s.ensureVTermLocked().Resize(int(rows), int(cols))
 		_ = pty.Setsize(s.master, &pty.Winsize{Rows: rows, Cols: cols})
 	}()
 }
@@ -1998,6 +1945,10 @@ func forwardSessionOutput(dst io.Writer, conn net.Conn) {
 }
 
 func forwardSessionOutputWithTracker(dst io.Writer, conn net.Conn, tracker *redrawTracker) {
+	forwardSessionOutputWithRenderer(dst, conn, tracker, nil)
+}
+
+func forwardSessionOutputWithRenderer(dst io.Writer, conn net.Conn, tracker *redrawTracker, renderer *clientSessionRenderer) {
 	const maxBatch = 64 << 10
 	buf := make([]byte, 32<<10)
 	batch := make([]byte, 0, maxBatch)
@@ -2023,22 +1974,28 @@ func forwardSessionOutputWithTracker(dst io.Writer, conn net.Conn, tracker *redr
 				}
 			}
 			_ = conn.SetReadDeadline(time.Time{})
-			out := normalizeScrollbackClear(batch)
-			var skip bool
-			out, skip = compactor.compact(out)
-			if skip {
-				continue
-			}
-			if shouldWrapSyncOutput(out) {
-				wrapped := make([]byte, 0, len(syncUpdateBegin)+len(out)+len(syncUpdateEnd))
-				wrapped = append(wrapped, syncUpdateBegin...)
-				wrapped = append(wrapped, out...)
-				wrapped = append(wrapped, syncUpdateEnd...)
-				out = wrapped
-			}
-			tracker.observe(out)
-			if _, werr := dst.Write(out); werr != nil {
-				return
+			if renderer != nil {
+				if werr := renderer.ProcessChunk(batch); werr != nil {
+					return
+				}
+			} else {
+				out := normalizeScrollbackClear(batch)
+				var skip bool
+				out, skip = compactor.compact(out)
+				if skip {
+					continue
+				}
+				if shouldWrapSyncOutput(out) {
+					wrapped := make([]byte, 0, len(syncUpdateBegin)+len(out)+len(syncUpdateEnd))
+					wrapped = append(wrapped, syncUpdateBegin...)
+					wrapped = append(wrapped, out...)
+					wrapped = append(wrapped, syncUpdateEnd...)
+					out = wrapped
+				}
+				tracker.observe(out)
+				if _, werr := dst.Write(out); werr != nil {
+					return
+				}
 			}
 		}
 		if err != nil {
@@ -2169,6 +2126,27 @@ func sendWindowSizeBounce(w io.Writer, tracker *redrawTracker, stop <-chan struc
 		return nil
 	}
 	go runWindowSizeBounce(w, height, width, tracker, stop)
+	return nil
+}
+
+func sendWindowSizeSmartReattach(w io.Writer, tracker *redrawTracker, renderer *clientSessionRenderer, stop <-chan struct{}) error {
+	width, height, err := term.GetSize(0)
+	if err != nil || width <= 0 || height <= 0 {
+		return nil
+	}
+	go func() {
+		waitForInitialHistory(tracker, stop)
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		if renderer != nil && renderer.HasServerScrollback() {
+			_ = writeResizeFrame(w, height, width)
+			return
+		}
+		runWindowSizeBounce(w, height, width, tracker, stop)
+	}()
 	return nil
 }
 
@@ -2305,6 +2283,10 @@ func writeResizeFrame(w io.Writer, rows, cols int) error {
 }
 
 func watchWindowSizeWithTracker(w io.Writer, tracker *redrawTracker, stop <-chan struct{}) {
+	watchWindowSizeWithRenderer(w, tracker, nil, stop)
+}
+
+func watchWindowSizeWithRenderer(w io.Writer, tracker *redrawTracker, renderer *clientSessionRenderer, stop <-chan struct{}) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGWINCH)
 	defer signal.Stop(ch)
@@ -2314,6 +2296,18 @@ func watchWindowSizeWithTracker(w io.Writer, tracker *redrawTracker, stop <-chan
 			return
 		case <-ch:
 			tracker.resetCompactor()
+			if renderer != nil {
+				width, height, err := term.GetSize(0)
+				if err == nil && width > 0 && height > 0 {
+					sizeChanged, hasScrollback, _ := renderer.ResizeAndRepaint(height, width)
+					if !sizeChanged && !hasScrollback {
+						_ = sendWindowSizeBounce(w, tracker, stop)
+						continue
+					}
+					_ = writeResizeFrame(w, height, width)
+					continue
+				}
+			}
 			_ = sendWindowSize(w)
 		}
 	}
