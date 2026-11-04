@@ -496,10 +496,13 @@ type vterm struct {
 	activeCharset int // 0 = G0 (SI), 1 = G1 (SO)
 
 	// Metadata & passthrough
-	title                string
-	cwd                  string
-	agentState           string
-	progressSeq          string
+	title                 string
+	cwd                   string
+	agentState            string
+	sawOSC7501            bool
+	sawWorkingSinceEncode bool
+	lastSpinnerAt         time.Time
+	progressSeq           string
 	lastDECRPM           string
 	lastPrintedCh        rune
 	lastPrintedCombining string
@@ -1554,12 +1557,27 @@ func (vt *vterm) dispatchOSC(payload string) {
 		vt.pendingPassthrough.WriteString("\x1b]52;")
 		vt.pendingPassthrough.WriteString(rest)
 		vt.pendingPassthrough.WriteByte(0x07)
+	case "21337":
+		if !vt.inSnapshot {
+			vt.pendingPassthrough.WriteString("\x1b]21337;")
+			vt.pendingPassthrough.WriteString(rest)
+			vt.pendingPassthrough.WriteByte(0x07)
+		}
 	case "7501":
 		s := strings.TrimSpace(rest)
+		if s == "?" || strings.HasPrefix(s, "?") {
+			vt.pendingReplies.WriteString("\x1b]7501;?\x1b\\")
+			return
+		}
+		vt.sawOSC7501 = true
+		vt.lastSpinnerAt = time.Time{}
 		switch {
+		case strings.Contains(s, "state=working"):
+			vt.sawWorkingSinceEncode = true
+			vt.agentState = s
 		case strings.Contains(s, "state=done"):
-			vt.agentState = "state=idle"
-		case strings.Contains(s, "state=clear"), strings.Contains(s, "state=error"):
+			vt.agentState = strings.Replace(s, "state=done", "state=idle", 1)
+		case strings.Contains(s, "state=clear"):
 			vt.agentState = ""
 		default:
 			vt.agentState = s
@@ -2428,6 +2446,9 @@ func (vt *vterm) resetFull() {
 	vt.title = ""
 	vt.cwd = ""
 	vt.agentState = ""
+	vt.sawOSC7501 = false
+	vt.sawWorkingSinceEncode = false
+	vt.lastSpinnerAt = time.Time{}
 	vt.progressSeq = ""
 }
 
@@ -2935,6 +2956,52 @@ func (vt *vterm) DetectionLines(maxLines int) []string {
 		lines = lines[len(lines)-maxLines:]
 	}
 	return lines
+}
+
+const spinnerSettleDelay = 300 * time.Millisecond
+
+// HasActiveSpinnerLine checks whether the bottom region of the active screen
+// currently displays an active Braille spinner status line (e.g. "⠸ Working").
+func (vt *vterm) HasActiveSpinnerLine() bool {
+	scr := vt.activeScreen()
+	if scr == nil {
+		return false
+	}
+	substantiveCount := 0
+	for r := scr.rows - 1; r >= 0; r-- {
+		line := strings.TrimSpace(scr.grid[r].plainText())
+		if line == "" || isPureHorizontalRule(line) {
+			continue
+		}
+		if _, ok := parseSpinnerLine(line); ok {
+			return true
+		}
+		if isUIChromeLine(line) {
+			continue
+		}
+		if cleanSummaryText(line) != "" {
+			substantiveCount++
+			if substantiveCount >= 4 {
+				break
+			}
+		}
+	}
+	return false
+}
+
+func (vt *vterm) NextSpinnerSettleDeadline(currentAgentState string) (time.Time, bool) {
+	if vt.sawOSC7501 || currentAgentState != "state=working" || vt.lastSpinnerAt.IsZero() {
+		return time.Time{}, false
+	}
+	if vt.HasActiveSpinnerLine() {
+		return time.Time{}, false
+	}
+	return vt.lastSpinnerAt.Add(spinnerSettleDelay), true
+}
+
+func (vt *vterm) SpinnerSettleReady(currentAgentState string, now time.Time) bool {
+	deadline, ok := vt.NextSpinnerSettleDeadline(currentAgentState)
+	return ok && !now.Before(deadline)
 }
 
 // RenderPreviewANSI renders the bottom targetRows x targetCols of the active screen

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 )
@@ -154,10 +155,10 @@ func (b *BlitEncoder) Encode(vt *vterm, forceFull bool, now time.Time) []byte {
 
 	if needFull {
 		vt.DrainPushedScrollback()
-		return b.encodeFull(vt, rows, cols, target, settledR, settledC, settledVis, passthrough)
+		return b.encodeFull(vt, rows, cols, target, settledR, settledC, settledVis, passthrough, now)
 	}
 
-	return b.encodeDiff(vt, rows, cols, target, settledR, settledC, settledVis, passthrough)
+	return b.encodeDiff(vt, rows, cols, target, settledR, settledC, settledVis, passthrough, now)
 }
 
 func (b *BlitEncoder) encodeFull(
@@ -167,12 +168,13 @@ func (b *BlitEncoder) encodeFull(
 	settledR, settledC int,
 	settledVis bool,
 	passthrough []byte,
+	now time.Time,
 ) []byte {
 	var buf bytes.Buffer
 	buf.Write(passthrough)
 
 	scr := vt.activeScreen()
-	b.writeMetadataChanges(&buf, vt, true)
+	b.writeMetadataChanges(&buf, vt, true, now)
 
 	buf.WriteString("\x1b[?2026h\x1b[?25l\x1b]8;;\x1b\\\x1b[0m\x1b[r\x1b[?6l\x1b[?7l")
 
@@ -302,6 +304,7 @@ func (b *BlitEncoder) encodeDiff(
 	settledR, settledC int,
 	settledVis bool,
 	passthrough []byte,
+	now time.Time,
 ) []byte {
 	scr := vt.activeScreen()
 
@@ -361,7 +364,7 @@ func (b *BlitEncoder) encodeDiff(
 	cellsChanged := b.writeChangedCells(&cellBuf, rows, cols, target, scr.autoWrap)
 
 	var metaBuf bytes.Buffer
-	b.writeMetadataChanges(&metaBuf, vt, false)
+	b.writeMetadataChanges(&metaBuf, vt, false, now)
 
 	var modeBuf bytes.Buffer
 	b.writeTerminalModes(&modeBuf, vt, scr, false)
@@ -494,7 +497,7 @@ func (b *BlitEncoder) writeChangedCells(buf *bytes.Buffer, rows, cols int, targe
 	return changed
 }
 
-func (b *BlitEncoder) writeMetadataChanges(buf *bytes.Buffer, vt *vterm, force bool) {
+func (b *BlitEncoder) writeMetadataChanges(buf *bytes.Buffer, vt *vterm, force bool, now time.Time) {
 	if (force && vt.title != "") || (!force && vt.title != b.title) {
 		buf.WriteString("\x1b]2;")
 		buf.WriteString(vt.title)
@@ -509,16 +512,40 @@ func (b *BlitEncoder) writeMetadataChanges(buf *bytes.Buffer, vt *vterm, force b
 	}
 	b.cwd = vt.cwd
 
-	if (force && vt.agentState != "") || (!force && vt.agentState != b.agentState) {
-		buf.WriteString("\x1b]7501;")
-		if vt.agentState == "" {
-			buf.WriteString("state=clear")
-		} else {
-			buf.WriteString(vt.agentState)
+	sawWorking := vt.sawWorkingSinceEncode
+	vt.sawWorkingSinceEncode = false
+	if vt.sawOSC7501 {
+		if !force && sawWorking && !strings.Contains(b.agentState, "state=working") && !strings.Contains(vt.agentState, "state=working") {
+			buf.WriteString("\x1b]7501;state=working\x07")
 		}
-		buf.WriteByte(0x07)
+		if (force && vt.agentState != "") || (!force && vt.agentState != b.agentState) {
+			buf.WriteString("\x1b]7501;")
+			if vt.agentState == "" {
+				buf.WriteString("state=clear")
+			} else {
+				buf.WriteString(vt.agentState)
+			}
+			buf.WriteByte(0x07)
+		}
+		b.agentState = vt.agentState
+	} else {
+		inferred := b.agentState
+		if vt.HasActiveSpinnerLine() {
+			vt.lastSpinnerAt = now
+			inferred = "state=working"
+		} else if b.agentState == "state=working" {
+			if vt.lastSpinnerAt.IsZero() || now.Sub(vt.lastSpinnerAt) >= spinnerSettleDelay {
+				inferred = "state=idle"
+				vt.lastSpinnerAt = time.Time{}
+			}
+		}
+		if (force && inferred != "") || (!force && inferred != b.agentState && inferred != "") {
+			buf.WriteString("\x1b]7501;")
+			buf.WriteString(inferred)
+			buf.WriteByte(0x07)
+		}
+		b.agentState = inferred
 	}
-	b.agentState = vt.agentState
 
 	if (force && vt.progressSeq != "") || (!force && vt.progressSeq != b.progressSeq) {
 		buf.WriteString("\x1b]9;")
@@ -814,6 +841,12 @@ func (r *clientSessionRenderer) onSyncTimeout() {
 
 func (r *clientSessionRenderer) scheduleCursorSettleLocked(now time.Time) {
 	deadline, ok := r.vt.cursorSettle.NextDeadline()
+	if spDeadline, spOK := r.vt.NextSpinnerSettleDeadline(r.blit.agentState); spOK {
+		if !ok || spDeadline.Before(deadline) {
+			deadline = spDeadline
+			ok = true
+		}
+	}
 	if !ok {
 		if r.settleTimer != nil {
 			r.settleTimer.Stop()
@@ -838,7 +871,9 @@ func (r *clientSessionRenderer) onCursorSettleTimer() {
 		return
 	}
 	now := time.Now()
-	if !r.vt.cursorSettle.Advance(now) {
+	cursorReady := r.vt.cursorSettle.Advance(now)
+	spinnerReady := r.vt.SpinnerSettleReady(r.blit.agentState, now)
+	if !cursorReady && !spinnerReady {
 		r.scheduleCursorSettleLocked(now)
 		return
 	}

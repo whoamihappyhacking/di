@@ -1468,4 +1468,37 @@ func TestHeldKeyRepeatZeroLagAndKittyKeyboardStack(t *testing.T) {
 	}
 }
 
+func TestProgramStatusNegotiationAndSpinnerFallback(t *testing.T) {
+	// 1. OSC 7501;? capability probe must reply before DA1 and must not pollute agentState.
+	vt := newVTerm(10, 40)
+	vt.Write([]byte("\x1b[?u\x1b]7501;?\x1b\\\x1b[c"))
+	replies := string(vt.DrainReplies())
+	idx7501 := strings.Index(replies, "\x1b]7501;?\x1b\\")
+	idxDA1 := strings.Index(replies, "\x1b[?62;22c")
+	if idx7501 < 0 || idxDA1 < 0 || idx7501 >= idxDA1 {
+		t.Fatalf("expected 7501;? reply before DA1, got replies=%q", replies)
+	}
+	if vt.agentState != "" || vt.sawOSC7501 {
+		t.Fatalf("7501;? query must not set agentState=%q or sawOSC7501=%v", vt.agentState, vt.sawOSC7501)
+	}
+
+	// 2. Reattaching to a legacy server mid-turn (where OSC 7501 scrolled out of history)
+	// infers state=working from the active Braille spinner line and transitions when done.
+	var out bytes.Buffer
+	r := newClientSessionRenderer(&out, 10, 60, nil)
+	defer r.Close()
+
+	_ = r.ProcessChunk([]byte("previous output\r\n ⠸ Working\r\n"))
+	if !strings.Contains(out.String(), "\x1b]7501;state=working\x07") {
+		t.Fatalf("expected spinner fallback to emit state=working, got: %q", out.String())
+	}
+
+	out.Reset()
+	_ = r.ProcessChunk([]byte("\x1b]7501;state=done:app=pi\x1b\\"))
+	if !strings.Contains(out.String(), "\x1b]7501;state=idle:app=pi\x07") {
+		t.Fatalf("expected done transition to emit state=idle:app=pi, got: %q", out.String())
+	}
+}
+
+
 
