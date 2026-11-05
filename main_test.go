@@ -2,8 +2,7 @@ package main
 
 import (
 	"bytes"
-	"context"
-	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -19,1486 +18,1193 @@ import (
 	"github.com/creack/pty"
 )
 
-func TestAttachStatusCleanup(t *testing.T) {
-	for _, mode := range []string{"local-detach", "remote-detach", "eof"} {
-		t.Run(mode, func(t *testing.T) {
-			sock := filepath.Join(t.TempDir(), "session.sock")
-			listener, err := net.Listen("unix", sock)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer listener.Close()
-			serverDone := make(chan struct{})
-			go func() {
-				defer close(serverDone)
-				conn, err := listener.Accept()
-				if err != nil {
-					return
-				}
-				defer conn.Close()
-				_, _ = io.WriteString(conn, "\x1b]7501;state=working\x07STATUS_READY")
-				if mode != "local-detach" {
-					return
-				}
-				_, _ = io.Copy(io.Discard, conn)
-			}()
-			cmd := exec.Command(os.Args[0], "-test.run=^TestAttachStatusHelper$", "--", sock)
-			cmd.Env = append(os.Environ(), "DI_ATTACH_TEST=1", "D_DETACH=^]")
-			master, err := pty.Start(cmd)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer master.Close()
-			outputDone := make(chan []byte, 1)
-			go func() {
-				var output bytes.Buffer
-				buffer := make([]byte, 4096)
-				detached := false
-				for {
-					n, err := master.Read(buffer)
-					output.Write(buffer[:n])
-					if mode == "local-detach" && !detached && bytes.Contains(output.Bytes(), []byte("STATUS_READY")) {
-						detached = true
-						_, _ = master.Write([]byte{0x1d})
-					}
-					if err != nil {
-						outputDone <- output.Bytes()
-						return
-					}
-				}
-			}()
-			waitDone := make(chan error, 1)
-			go func() { waitDone <- cmd.Wait() }()
-			select {
-			case err := <-waitDone:
-				if err != nil {
-					t.Fatalf("attach helper: %v", err)
-				}
-			case <-time.After(5 * time.Second):
-				_ = cmd.Process.Kill()
-				t.Fatal("attach did not exit")
-			}
-			output := <-outputDone
-			working := bytes.LastIndex(output, []byte("\x1b]7501;state=working\x07"))
-			reset := bytes.LastIndex(output, []byte(terminalStatusReset))
-			if working < 0 || reset <= working {
-				t.Fatalf("missing ordered status cleanup: %q", output)
-			}
-			if bytes.Contains(output[reset:], []byte("state=done")) {
-				t.Fatal("detach must not report task completion")
-			}
-			<-serverDone
-		})
-	}
-}
-
-func TestAttachStatusHelper(t *testing.T) {
-	if os.Getenv("DI_ATTACH_TEST") != "1" {
-		return
-	}
-	if err := attach(os.Args[len(os.Args)-1]); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestAppendHistoryDeduplicatesInPlaceRedrawsAndPreservesScrollback(t *testing.T) {
-	s := &ptyServer{}
-	// Scrollback push: moves up 2 lines, writes 5 lines (down 4 > up 2).
-	s.appendHistory([]byte("\r\x1b[2Ascrollback-line-1\r\nscrollback-line-2\r\nscrollback-line-3\r\nviewport-1\r\nviewport-2"))
-	// Consecutive in-place spinner redraws: moves up 2 lines, writes 3 lines (down 2 <= up 2).
-	for i := 0; i < 50; i++ {
-		s.appendHistory([]byte(fmt.Sprintf("\r\x1b[2A\x1b[Kspinner-tick-%d\r\n\x1b[Kprompt-line-%d\r\n\x1b[Kstatus", i, i)))
-	}
-	hist := string(s.history)
-	if !strings.Contains(hist, "scrollback-line-1") || !strings.Contains(hist, "scrollback-line-3") {
-		t.Fatalf("scrollback lines were evicted by in-place redraws: %q", hist)
-	}
-	if strings.Contains(hist, "spinner-tick-0") || strings.Contains(hist, "spinner-tick-48") {
-		t.Fatalf("stale in-place redraw frame remained in history: %q", hist)
-	}
-	if !strings.Contains(hist, "spinner-tick-49") {
-		t.Fatalf("latest in-place redraw frame missing from history: %q", hist)
-	}
-
-	// Full screen clear resets history to the clear point.
-	s.appendHistory([]byte("before-clear\x1b[2J\x1b[Hfresh-history-after-resize"))
-	histAfterClear := string(s.history)
-	if strings.Contains(histAfterClear, "scrollback-line-1") || strings.Contains(histAfterClear, "before-clear") {
-		t.Fatalf("history kept content prior to full screen clear: %q", histAfterClear)
-	}
-	if !strings.HasPrefix(histAfterClear, "\x1b[2J\x1b[3J\x1b[Hfresh-history-after-resize") {
-		t.Fatalf("full screen clear was not normalized to clear scrollback: %q", histAfterClear)
-	}
-}
-
-func TestForwardSessionOutputCoalescesAndSynchronizesRedraws(t *testing.T) {
-	connReader, connWriter := net.Pipe()
-	defer connReader.Close()
-
-	go func() {
-		// Send an unwrapped multi-line redraw split across two chunks, plus a full clear.
-		_, _ = connWriter.Write([]byte("\r\x1b[3A\x1b[Jline-1\r\n"))
-		_, _ = connWriter.Write([]byte("\x1b[Kline-2\r\n\x1b[Kline-3\x1b[2J\x1b[H"))
-		_ = connWriter.Close()
-	}()
-
-	var dst bytes.Buffer
-	forwardSessionOutput(&dst, connReader)
-	got := dst.String()
-	if !strings.HasPrefix(got, "\x1b[?2026h") || !strings.HasSuffix(got, "\x1b[?2026l") {
-		t.Fatalf("multi-line redraw was not wrapped in synchronized output markers: %q", got)
-	}
-	if !strings.Contains(got, "\x1b[2J\x1b[3J\x1b[H") {
-		t.Fatalf("full screen clear was not upgraded to clear scrollback: %q", got)
-	}
-}
-
-func TestRunServerAnswersSyncOutputQueryAndReattachesWithSameSizeBounce(t *testing.T) {
-	sh, err := exec.LookPath("sh")
+// TestMain points the session directory at a private location so no test can
+// ever list, query or attach to the user's real sessions.
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "di-test-run-")
 	if err != nil {
-		t.Skip("sh is not available")
+		panic(err)
 	}
-
-	// Child queries DECRQM 2026, prints whether it received 2026;2$y, and prints WINCH on SIGWINCH.
-	script := `trap 'printf "\nWINCH\n"' WINCH; stty -echo raw; printf '\033[?2026$p'; dd bs=1 count=11 2>/dev/null; sleep 0.3`
-	output := runServerAndReadWithSameSizeReattach(t, []string{sh, "-c", script})
-	if !bytes.Contains(output, []byte("\x1b[?2026;2$y")) {
-		t.Fatalf("server did not reply to DECRQM 2026 query: %q", output)
-	}
-	if !bytes.Contains(output, []byte("WINCH")) {
-		t.Fatalf("server did not trigger SIGWINCH bounce on re-attach: %q", output)
-	}
+	os.Setenv("XDG_RUNTIME_DIR", dir)
+	code := m.Run()
+	os.RemoveAll(dir)
+	os.Exit(code)
 }
 
-func runServerAndReadWithSameSizeReattach(t *testing.T, command []string) []byte {
+// ---- emulator and snapshot fidelity ----
+
+type screenState struct {
+	alt                 bool
+	rows                []string
+	styles              [][]vtermStyle
+	curR, curC          int
+	pendingWrap         bool
+	cursorVis           bool
+	scrollTop, scrollBo int
+	originMode          bool
+	autoWrap            bool
+	savedR, savedC      int
+	kitty               []uint8
+	altKitty            []uint8
+	bracketed, focus    bool
+	mouse               int
+	mouseSGR            bool
+	appCursor, keypad   bool
+	cursorShape         uint8
+	style               vtermStyle
+	title               string
+	charsets            string
+}
+
+func captureState(vt *vterm) screenState {
+	scr := vt.activeScreen()
+	st := screenState{
+		alt:         vt.inAltScreen,
+		curR:        scr.curR,
+		curC:        scr.curC,
+		pendingWrap: scr.pendingWrap,
+		cursorVis:   scr.cursorVis,
+		scrollTop:   scr.scrollTop,
+		scrollBo:    scr.scrollBottom,
+		originMode:  scr.originMode,
+		autoWrap:    scr.autoWrap,
+		savedR:      scr.savedCurR,
+		savedC:      scr.savedCurC,
+		kitty:       append([]uint8(nil), vt.primary.kittyStack[:vt.primary.kittyLen]...),
+		altKitty:    append([]uint8(nil), vt.alt.kittyStack[:vt.alt.kittyLen]...),
+		bracketed:   vt.bracketedPaste,
+		focus:       vt.focusEvents,
+		mouse:       vt.mouseMode,
+		mouseSGR:    vt.mouseSGR,
+		appCursor:   vt.appCursorKeys,
+		keypad:      vt.appKeypad,
+		cursorShape: scr.cursorShape,
+		style:       vt.style,
+		title:       vt.title,
+		charsets:    fmt.Sprintf("%c%c%d", vt.g0Charset, vt.g1Charset, vt.activeCharset),
+	}
+	for _, row := range scr.grid {
+		st.rows = append(st.rows, row.plainText())
+		styles := make([]vtermStyle, len(row.cells))
+		for i, c := range row.cells {
+			styles[i] = c.style
+		}
+		st.styles = append(st.styles, styles)
+	}
+	return st
+}
+
+func scrollbackText(vt *vterm) []string {
+	var out []string
+	for _, line := range vt.scrollback {
+		out = append(out, cellsPlainText(decodeANSICells(line.ansi, line.width)))
+	}
+	return out
+}
+
+func assertSnapshotReplays(t *testing.T, rows, cols int, program string) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "session.sock")
-	done := make(chan error, 1)
-	go func() {
-		done <- runServer(append([]string{sock}, command...))
-	}()
+	app := newVTerm(rows, cols)
+	app.Write([]byte(program))
+	host := newVTerm(rows, cols)
+	// A shell session left output above the cursor, which sits on a fresh line.
+	host.Write([]byte("leftover shell text\r\n\x1b[31mred prompt\x1b[0m\r\n"))
+	host.Write(app.Snapshot())
 
-	if err := waitSocket(sock, serverStartWait); err != nil {
-		t.Fatal(err)
-	}
-
-	resize := make([]byte, 8)
-	binary.BigEndian.PutUint32(resize[:4], 24)
-	binary.BigEndian.PutUint32(resize[4:], 80)
-
-	// First attach sets 24x80, then detaches.
-	conn1, err := net.Dial("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writeFrame(conn1, frameResize, resize); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond)
-	_ = conn1.Close()
-
-	// Second attach sends the exact same 24x80 size; server should bounce cols to trigger SIGWINCH.
-	conn2, err := net.Dial("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn2.Close()
-	if err := writeFrame(conn2, frameResize, resize); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn2.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	output, err := io.ReadAll(conn2)
-	if err != nil {
-		t.Fatalf("read server output: %v", err)
-	}
-	<-done
-	return output
-}
-
-func TestFZFArgsReserveExpandedSelectionListAndBindSwitchKey(t *testing.T) {
-	args := fzfArgs("/tmp/di", 24)
-	if !containsArg(args, "--height=100%") {
-		t.Fatalf("picker should use the full terminal height: %v", args)
-	}
-	if !containsArg(args, "--preview-window=down,13,wrap,border-top") {
-		t.Fatalf("picker should reserve expanded selection rows: %v", args)
-	}
-	if !containsArg(args, `--bind=ctrl-\:down`) {
-		t.Fatalf("picker should bind Ctrl-\\ to move down: %v", args)
-	}
-	if !containsArg(args, "--no-hscroll") {
-		t.Fatalf("picker should keep aligned columns in view: %v", args)
-	}
-	if !containsArg(args, "--preview='/tmp/di' --preview {1}") {
-		t.Fatalf("preview command should pass the socket field: %v", args)
-	}
-}
-
-func TestSwitchKeyInput(t *testing.T) {
-	if !isSwitchInput([]byte{0x1c}) {
-		t.Fatal("default Ctrl-\\ (0x1c) was not recognized as switch input")
-	}
-	if !isSwitchInput([]byte("\x1b[92;5u")) {
-		t.Fatal("CSI u Ctrl-\\ sequence was not recognized as switch input")
-	}
-	if isSwitchInput([]byte{0x1d}) {
-		t.Fatal("Ctrl-] detach key must not trigger switch input")
-	}
-}
-
-func TestExtractSessionSummaryAndStatus(t *testing.T) {
-	rule := strings.Repeat("─", 94)
-	busyOutput := []byte(fmt.Sprintf(
-		"  上一轮对话内容\r\n  真正有价值的最近回复摘要\r\n\r\n%s\r\n>\r\n%s\r\n⣽  Read\r\n? for shortcuts",
-		rule, rule,
-	))
-	status, summary := extractSessionSummary(busyOutput)
-	if status != "●" {
-		t.Fatalf("status = %q, want ● for active spinner", status)
-	}
-	if !strings.Contains(summary, "[Read]") || !strings.Contains(summary, "真正有价值的最近回复摘要") {
-		t.Fatalf("summary = %q, want tool name and latest conversation line", summary)
-	}
-
-	ompWorking := []byte("\x1b]7501;state=working:app=omp\x1b\\working line\r\n")
-	if st, _ := extractSessionSummary(ompWorking); st != "●" {
-		t.Fatalf("omp working status = %q, want ●", st)
-	}
-	ompDone := []byte("\x1b]7501;state=working:app=omp\x1b\\working line\r\n\x1b]7501;state=done:app=omp\x1b\\")
-	if st, _ := extractSessionSummary(ompDone); st != "○" {
-		t.Fatalf("omp done status = %q, want ○", st)
-	}
-}
-
-func TestRenderPreviewCollapsesPaddingAndPreservesConversation(t *testing.T) {
-	// Simulate a 33-row viewport redraw with 20 blank padding lines above the spinner.
-	var frame strings.Builder
-	frame.WriteString("对话第一行内容\r\n对话第二行内容\r\n")
-	for i := 0; i < 20; i++ {
-		frame.WriteString("\r\n")
-	}
-	frame.WriteString("⣟  Read\r\n")
-	preview := string(renderPreview([]byte(frame.String()), 80, 10))
-	if !strings.Contains(preview, "对话第一行内容") || !strings.Contains(preview, "⣟  Read") {
-		t.Fatalf("preview lost conversation text due to blank padding lines: %q", preview)
-	}
-}
-
-func TestRenderPreviewUsesFinalTerminalScreen(t *testing.T) {
-	output := []byte("stale screen\x1b[2J\x1b[Hagent current screen")
-	preview := string(renderPreview(output, 80, 8))
-	if !strings.Contains(preview, "agent current screen") {
-		t.Fatalf("preview = %q, want current screen content", preview)
-	}
-	if strings.Contains(preview, "stale screen") {
-		t.Fatalf("preview kept content cleared by terminal redraw: %q", preview)
-	}
-}
-
-func TestPreviewSizeUsesFZFDimensions(t *testing.T) {
-	t.Setenv("FZF_PREVIEW_COLUMNS", "73")
-	t.Setenv("FZF_PREVIEW_LINES", "19")
-	cols, rows := previewSize()
-	if cols != 73 || rows != 19 {
-		t.Fatalf("preview size = %d x %d, want 73 x 19", cols, rows)
-	}
-}
-
-func TestPreviewSessionWritesOnlyTerminalContent(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "session.sock")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	go func() {
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
-			return
+	want, got := captureState(app), captureState(host)
+	for r := range want.rows {
+		if want.rows[r] != got.rows[r] {
+			t.Errorf("row %d = %q, want %q", r, got.rows[r], want.rows[r])
 		}
-		_, _ = conn.Write([]byte("agent content\n"))
-		_ = conn.Close()
-	}()
-
-	oldStdout := os.Stdout
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
+		for c := range want.styles[r] {
+			if want.styles[r][c] != got.styles[r][c] {
+				t.Errorf("row %d col %d style = %+v, want %+v", r, c, got.styles[r][c], want.styles[r][c])
+				break
+			}
+		}
 	}
-	os.Stdout = writer
-	previewErr := previewSession([]string{sock})
-	_ = writer.Close()
-	os.Stdout = oldStdout
-	output, readErr := io.ReadAll(reader)
-	_ = reader.Close()
-	if previewErr != nil {
-		t.Fatalf("render preview: %v", previewErr)
+	want.rows, got.rows, want.styles, got.styles = nil, nil, nil, nil
+	if fmt.Sprintf("%+v", want) != fmt.Sprintf("%+v", got) {
+		t.Errorf("terminal state differs\n got: %+v\nwant: %+v", got, want)
 	}
-	if readErr != nil {
-		t.Fatalf("read preview: %v", readErr)
+	switch {
+	case len(app.scrollback) > 0:
+		if w, g := strings.Join(scrollbackText(app), "\n"), strings.Join(scrollbackText(host), "\n"); w != g {
+			t.Errorf("scrollback differs\n got: %q\nwant: %q", g, w)
+		}
+	default:
+		// Without session history to restore, the terminal keeps its own.
+		if sb := scrollbackText(host); strings.Join(sb, "|") != "leftover shell text|red prompt" {
+			t.Errorf("terminal history was not preserved exactly: %q", sb)
+		}
 	}
-	if string(output) != "agent content\n" {
-		t.Fatalf("preview = %q, want terminal content only", output)
+	// The same program continuing after the snapshot must keep both in sync.
+	tail := "\x1b[2;3Hafter\x1b[K\r\nmore output ✅ 中文\r\n"
+	app.Write([]byte(tail))
+	host.Write([]byte(tail))
+	if w, g := captureState(app).rows, captureState(host).rows; strings.Join(w, "\n") != strings.Join(g, "\n") {
+		t.Errorf("screens diverge after continuing output\n got: %q\nwant: %q", g, w)
 	}
 }
 
-func TestSessionPreviewOutputReadsHistoryWithoutWaitingForSessionExit(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "session.sock")
-	ln, err := net.Listen("unix", sock)
+func TestSnapshotReplaysShellOutputWithScrollbackAndWrapping(t *testing.T) {
+	var p strings.Builder
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&p, "\x1b[3%dmline %02d\x1b[0m plain ✅ 中文 \x1b]8;;https://x.test\x1b\\link\x1b]8;;\x1b\\\r\n", i%8, i)
+	}
+	p.WriteString(strings.Repeat("long-wrapped-", 9) + "\r\n")
+	p.WriteString("\x1b[44m blue background \x1b[K\x1b[0m\r\n")
+	p.WriteString("\x1b[4:3;58:2::200:10:10mcurly\x1b[0m \x1b[4;58;5;33mplain\x1b[0m\r\n$ ")
+	assertSnapshotReplays(t, 8, 40, p.String())
+}
+
+func TestSnapshotReplaysInlineAgentRedraws(t *testing.T) {
+	var p strings.Builder
+	p.WriteString("\x1b[?2004h\x1b[>1u\x1b[?1004h")
+	for i := 0; i < 12; i++ {
+		fmt.Fprintf(&p, "⏺ assistant message %d with some text\r\n\r\n", i)
+	}
+	box := "╭──────────────────────────────╮\r\n│ > type here                  │\r\n╰──────────────────────────────╯\r\n  ? for shortcuts"
+	p.WriteString(box)
+	for i := 0; i < 5; i++ {
+		fmt.Fprintf(&p, "\x1b[?2026h\r\x1b[4A\x1b[J⠋ Working (%ds)\r\n%s\x1b[?2026l", i, box)
+	}
+	p.WriteString("\x1b[2A\x1b[5G")
+	assertSnapshotReplays(t, 10, 34, p.String())
+}
+
+func TestSnapshotReplaysAltScreenModesAndSavedCursors(t *testing.T) {
+	var p strings.Builder
+	p.WriteString("primary before\r\nprompt$ \x1b[1;32m")
+	p.WriteString("\x1b[>5u\x1b[?1049h\x1b[>3u\x1b[?1h\x1b=\x1b[?1002h\x1b[?1006h\x1b[5 q\x1b]2;my title\x07")
+	p.WriteString("\x1b[H\x1b[2Jheader\x1b[3;9r\x1b[?6h\x1b[2;4Hin region\x1b7\x1b[5;1Hcursor here\x1b(0lqk\x1b(B")
+	p.WriteString("\x1b[0;4;38;2;10;20;30mstyled")
+	assertSnapshotReplays(t, 12, 30, p.String())
+}
+
+func TestSnapshotReplaysPendingWrapAndWideCharacters(t *testing.T) {
+	p := "中文字符测试中文字符测试中文字符测试" + "\r\n" + strings.Repeat("x", 19) + "中" + "abcdefghijklmnopqrst"
+	assertSnapshotReplays(t, 6, 20, p)
+}
+
+func TestSnapshotLeavesPrimaryCursorForAltScreenExit(t *testing.T) {
+	app := newVTerm(6, 20)
+	app.Write([]byte("one\r\ntwo\x1b[?1049h\x1b[Halt"))
+	host := newVTerm(6, 20)
+	host.Write(app.Snapshot())
+	exit := []byte("\x1b[?1049lX")
+	app.Write(exit)
+	host.Write(exit)
+	if w, g := captureState(app), captureState(host); w.curR != g.curR || w.curC != g.curC || w.rows[1] != g.rows[1] {
+		t.Fatalf("after leaving alt screen host=(%d,%d %q) app=(%d,%d %q)", g.curR, g.curC, g.rows[1], w.curR, w.curC, w.rows[1])
+	}
+}
+
+func TestEraseScrollbackMatchesRealTerminals(t *testing.T) {
+	vt := newVTerm(3, 20)
+	vt.Write([]byte("a\r\nb\r\nc\r\nd\r\ne"))
+	if got := scrollbackText(vt); strings.Join(got, ",") != "a,b" {
+		t.Fatalf("scrollback = %q", got)
+	}
+	// Agents clear and reprint their transcript on resize; nothing may be duplicated.
+	vt.Write([]byte("\x1b[H\x1b[2J\x1b[3Ja\r\nb\r\nc\r\nd\r\ne"))
+	if got := scrollbackText(vt); strings.Join(got, ",") != "a,b" {
+		t.Fatalf("scrollback after reprint = %q", got)
+	}
+}
+
+func TestResizeReflowsSoftWrappedLines(t *testing.T) {
+	vt := newVTerm(4, 10)
+	vt.Write([]byte("0123456789abcdef\r\nnext"))
+	vt.Resize(4, 20)
+	if got := vt.primary.grid[0].plainText(); got != "0123456789abcdef" {
+		t.Fatalf("row 0 after widening = %q", got)
+	}
+	if vt.primary.curR != 1 || vt.primary.curC != 4 {
+		t.Fatalf("cursor after widening = %d,%d", vt.primary.curR, vt.primary.curC)
+	}
+}
+
+func TestRuneWidths(t *testing.T) {
+	for r, want := range map[rune]int{'a': 1, '中': 2, '✅': 2, '❌': 2, '⚡': 2, '⭐': 2, '🔧': 2, '─': 1, '⏺': 1, '✻': 1, '\u0301': 0, '\u200d': 0, 'ｱ': 1, 'Ａ': 2} {
+		if got := singleRuneWidth(r); got != want {
+			t.Errorf("width(%q) = %d, want %d", r, got, want)
+		}
+	}
+}
+
+func TestEmulatorAnswersQueriesAndTracksNotifications(t *testing.T) {
+	vt := newVTerm(5, 20)
+	vt.Write([]byte("ab\x1b[6n\x1b[c\x1b[?2026$p\x1b[?u\x07\x1b]9;Agent needs you\x07\x1b]9;4;1;50\x07\x1b]7501;?\x07"))
+	if got := string(vt.DrainReplies()); got != "\x1b[1;3R\x1b[?62;22c\x1b[?2026;2$y\x1b[?0u" {
+		t.Fatalf("replies = %q", got)
+	}
+	if got := string(vt.DrainStatusReplies()); got != "\x1b]7501;?\x1b\\" {
+		t.Fatalf("status replies = %q", got)
+	}
+	if vt.bells != 1 || vt.notices != 1 || vt.lastNotice != "Agent needs you" || vt.progressSeq != "4;1;50" {
+		t.Fatalf("bells=%d notices=%d notice=%q progress=%q", vt.bells, vt.notices, vt.lastNotice, vt.progressSeq)
+	}
+}
+
+func TestHostRestoreUndoesSessionModes(t *testing.T) {
+	tracker := newVTerm(10, 40)
+	tracker.Write([]byte("\x1b[>1u\x1b[>5u\x1b[?1049h\x1b[>3u\x1b[?2004h\x1b[?1003h"))
+	got := hostRestoreSequence(tracker)
+	for _, want := range []string{"\x1b[<1u\x1b[?1049l\x1b[<2u", "\x1b[?2004l", "\x1b[?1003l", "\x1b[?25h"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("restore sequence %q missing %q", got, want)
+		}
+	}
+	host := newVTerm(10, 40)
+	host.Write([]byte("\x1b[>1u\x1b[>5u\x1b[?1049h\x1b[>3u\x1b[?2004h\x1b[?1003h"))
+	host.Write([]byte(got))
+	if host.inAltScreen || host.primary.kittyLen != 0 || host.alt.kittyLen != 0 || host.bracketedPaste || host.mouseMode != 0 {
+		t.Fatalf("host still has session modes: alt=%v kitty=%d/%d paste=%v mouse=%d",
+			host.inAltScreen, host.primary.kittyLen, host.alt.kittyLen, host.bracketedPaste, host.mouseMode)
+	}
+}
+
+// ---- previews and summaries ----
+
+func TestPreviewFitsNarrowWindow(t *testing.T) {
+	vt := newVTerm(8, 60)
+	vt.Write([]byte("older line\r\n"))
+	vt.Write([]byte(strings.Repeat("─", 60) + "\r\n"))
+	vt.Write([]byte("│ > prompt" + strings.Repeat(" ", 48) + "│\r\n"))
+	vt.Write([]byte("⏺ " + strings.Repeat("word ", 14) + "\r\n"))
+	lines := strings.Split(stripANSI(vt.Preview(30, 10)), "\n")
+	for _, line := range lines {
+		if w := runeDisplayWidth(line); w > 30 {
+			t.Errorf("line %q is %d columns wide", line, w)
+		}
+	}
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{"older line", "│ > prompt", "│"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("preview missing %q:\n%s", want, joined)
+		}
+	}
+	if got := strings.Count(strings.ReplaceAll(joined, "\n", ""), "word"); got != 14 {
+		t.Errorf("wrapped text lost words: %d\n%s", got, joined)
+	}
+}
+
+func stripANSI(s string) string {
+	vt := newVTerm(1, maxVTermCols)
+	var out []string
+	for _, line := range strings.Split(s, "\n") {
+		vt = newVTerm(1, maxVTermCols)
+		vt.primary.autoWrap = false
+		vt.Write([]byte(line))
+		out = append(out, vt.primary.grid[0].plainText())
+	}
+	return strings.Join(out, "\n")
+}
+
+func TestSummarySkipsAgentChrome(t *testing.T) {
+	vt := newVTerm(12, 60)
+	vt.Write([]byte("⏺ Refactored the attach path.\r\n\r\n⠙ Running tests…\r\n╭────────╮\r\n│ >      │\r\n╰────────╯\r\n  ? for shortcuts\r\n"))
+	activity, text := vt.Summary()
+	if activity != "Running tests…" || text != "Refactored the attach path." {
+		t.Fatalf("activity=%q text=%q", activity, text)
+	}
+	vt.Write([]byte("\x1b]0;✳ Fix login bug\x07"))
+	if got := vt.CleanTitle(); got != "Fix login bug" {
+		t.Fatalf("title = %q", got)
+	}
+}
+
+// ---- state classification and picker ----
+
+func TestActivityState(t *testing.T) {
+	now := time.Now()
+	seen := now.Add(-time.Minute)
+	for _, tc := range []struct {
+		name       string
+		agent      string
+		attention  bool
+		attached   bool
+		lastOutput time.Time
+		want       string
+	}{
+		{"recent output", "", false, false, now.Add(-time.Second), "busy"},
+		{"quiet with unseen output", "", false, false, now.Add(-10 * time.Second), "new"},
+		{"quiet and seen", "", false, false, seen.Add(-time.Second), "idle"},
+		{"bell while detached", "", true, false, now.Add(-10 * time.Second), "waiting"},
+		{"attached is never new", "", false, true, now.Add(-10 * time.Second), "idle"},
+		{"agent reports blocked", "state=blocked", false, false, now.Add(-time.Second), "waiting"},
+		{"agent reports working", "state=working", false, false, seen.Add(-time.Hour), "busy"},
+		{"agent reports idle", "state=idle", false, false, now.Add(-time.Second), "new"},
+	} {
+		if got := activityState(tc.agent, tc.attention, tc.attached, tc.lastOutput, seen, now); got != tc.want {
+			t.Errorf("%s: state = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestSortSessionsPutsAttentionFirstAndCurrentLast(t *testing.T) {
+	now := time.Now()
+	list := []sessionEntry{
+		{Sock: "current", Current: true, Status: sessionStatus{State: "waiting"}},
+		{Sock: "idle-old", Status: sessionStatus{State: "idle", LastSeen: now.Add(-time.Hour)}},
+		{Sock: "busy", Status: sessionStatus{State: "busy", LastSeen: now.Add(-2 * time.Hour)}},
+		{Sock: "idle-recent", Status: sessionStatus{State: "idle", LastSeen: now.Add(-time.Minute)}},
+		{Sock: "new", Status: sessionStatus{State: "new", LastOutput: now.Add(-time.Minute)}},
+		{Sock: "waiting", Status: sessionStatus{State: "waiting", LastOutput: now.Add(-time.Hour)}},
+	}
+	sortSessions(list)
+	var got []string
+	for _, e := range list {
+		got = append(got, e.Sock)
+	}
+	if strings.Join(got, ",") != "waiting,new,busy,idle-recent,idle-old,current" {
+		t.Fatalf("order = %v", got)
+	}
+}
+
+func TestPickerColumnsAlign(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	now := time.Now()
+	entries := []sessionEntry{
+		{Sock: "/tmp/a.sock", Meta: sessionMeta{Command: []string{"codex", "--yolo"}, PWD: home + "/src/very/long/project/path/name"},
+			Status: sessionStatus{State: "busy", Activity: "Running tests", LastOutput: now}},
+		{Sock: "/tmp/b.sock", Meta: sessionMeta{Command: []string{"claude", "--dangerously-skip-permissions"}, PWD: home},
+			Status: sessionStatus{State: "waiting", Notice: "Claude needs your permission", Title: "修复登录问题"}},
+		{Sock: "/tmp/c.sock", Meta: sessionMeta{Command: []string{"make"}, PWD: "/srv"},
+			Status: sessionStatus{State: "exited", ExitCode: 2, ExitedAt: now.Add(-3 * time.Hour)}},
+	}
+	width := -1
+	for _, e := range entries {
+		line := e.columns(100, false, now)
+		if width >= 0 && runeDisplayWidth(line) != width {
+			t.Errorf("line widths differ: %q", line)
+		}
+		width = runeDisplayWidth(line)
+	}
+	b := entries[1].columns(100, false, now)
+	if !strings.Contains(b, "待处理") || !strings.Contains(b, "claude ") || strings.Contains(b, "dangerously") {
+		t.Errorf("waiting line = %q", b)
+	}
+	if a := entries[0].columns(100, false, now); !strings.Contains(a, "…/") || !strings.Contains(a, "Running tests") {
+		t.Errorf("busy line = %q", a)
+	}
+	if c := entries[2].columns(100, false, now); !strings.Contains(c, "[exit 2]") || !strings.Contains(c, "3h") {
+		t.Errorf("exited line = %q", c)
+	}
+}
+
+func TestFZFArgs(t *testing.T) {
+	args := strings.Join(fzfArgs("/bin/d", "/run/di/x.sock", "", 40), "\n")
+	for _, want := range []string{"--ansi", "--with-nth=2..", "--preview='/bin/d' --preview {1}", "--bind=ctrl-\\:down", "--current '/run/di/x.sock'", "--kill-confirm {1}"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("fzf args missing %q:\n%s", want, args)
+		}
+	}
+	if strings.Contains(args, "--select-1") {
+		t.Error("switching must always show the picker")
+	}
+	if !strings.Contains(strings.Join(fzfArgs("/bin/d", "", "cod", 40), "\n"), "--query=cod") {
+		t.Error("query not passed to fzf")
+	}
+}
+
+// ---- input keys ----
+
+func TestInputKeyScanning(t *testing.T) {
+	keys := func() *inputKeys { return &inputKeys{detach: 0x1d, switchKey: 0x1c} }
+	for _, tc := range []struct {
+		in     string
+		fwd    string
+		action attachEnd
+		hit    bool
+	}{
+		{"\x1d", "", endDetach, true},
+		{"abc\x1dxyz", "abc", endDetach, true},
+		{"\x1c", "", endSwitch, true},
+		{"ls\r", "ls\r", 0, false},
+		{"x\x1b[93;5u", "x", endDetach, true},
+		{"\x1b[93;5:1u", "", endDetach, true},
+		{"\x1b[93;5:3u", "\x1b[93;5:3u", 0, false},
+		{"\x1b[93;69u", "", endDetach, true},
+		{"\x1b[93;7u", "\x1b[93;7u", 0, false},
+		{"\x1b[27;5;92~", "", endSwitch, true},
+		{"\x1b[A\x1b[<64;10;5M", "\x1b[A\x1b[<64;10;5M", 0, false},
+		{"\x1b[200~paste \x1d here\x1b[201~", "\x1b[200~paste \x1d here\x1b[201~", 0, false},
+		{"\x1b[200~paste\x1b[201~\x1d", "\x1b[200~paste\x1b[201~", endDetach, true},
+	} {
+		fwd, action, hit := keys().scan([]byte(tc.in))
+		if string(fwd) != tc.fwd || action != tc.action || hit != tc.hit {
+			t.Errorf("scan(%q) = %q,%v,%v want %q,%v,%v", tc.in, fwd, action, hit, tc.fwd, tc.action, tc.hit)
+		}
+	}
+	// A paste split across reads stays a paste.
+	k := keys()
+	if _, _, hit := k.scan([]byte("\x1b[200~first \x1d")); hit {
+		t.Fatal("detach key inside paste")
+	}
+	if _, _, hit := k.scan([]byte("second \x1d\x1b[201~")); hit {
+		t.Fatal("detach key inside continued paste")
+	}
+	if _, action, hit := k.scan([]byte("\x1d")); !hit || action != endDetach {
+		t.Fatal("detach key after paste ended")
+	}
+}
+
+func TestParseCtrlKey(t *testing.T) {
+	if parseCtrlKey("", defaultDetachKey) != 0x1d || parseCtrlKey("", defaultSwitchKey) != 0x1c || parseCtrlKey("^B", "") != 0x02 {
+		t.Fatal("unexpected control key")
+	}
+}
+
+// ---- server end to end ----
+
+type testServer struct {
+	sock string
+	done chan error
+}
+
+func startTestServer(t *testing.T, args ...string) *testServer {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "di-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
-			return
-		}
-		defer conn.Close()
-		_, _ = conn.Write([]byte("history line\n"))
-		time.Sleep(500 * time.Millisecond)
-	}()
-
-	output, err := sessionPreviewOutput(sock)
-	if err != nil {
-		t.Fatalf("read session preview: %v", err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	s := &testServer{sock: filepath.Join(dir, "s.sock"), done: make(chan error, 1)}
+	t.Setenv("DI_INITIAL_ROWS", "12")
+	t.Setenv("DI_INITIAL_COLS", "60")
+	go func() { s.done <- runServer(append([]string{s.sock}, args...)) }()
+	if err := waitSocket(s.sock, 2*time.Second); err != nil {
+		t.Fatal(err)
 	}
-	if string(output) != "history line\n" {
-		t.Fatalf("preview output = %q, want history line", output)
-	}
+	return s
+}
+
+func (s *testServer) waitExit(t *testing.T) {
+	t.Helper()
 	select {
-	case <-serverDone:
-	case <-time.After(time.Second):
-		t.Fatal("preview test server did not finish")
+	case <-s.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not exit")
+	}
+	if isSocket(s.sock) {
+		t.Fatal("socket left behind")
 	}
 }
 
-func TestSessionPreviewOutputKeepsHistoryWhenSessionCloses(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "session.sock")
-	ln, err := net.Listen("unix", sock)
+type testClient struct {
+	conn  net.Conn
+	out   bytes.Buffer
+	exit  *exitInfo
+	hello helloInfo
+	gone  bool
+}
+
+func attachTestClient(t *testing.T, sock string, rows, cols int) *testClient {
+	t.Helper()
+	conn, err := dialSession(sock)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	t.Cleanup(func() { conn.Close() })
+	if err := writeFrame(conn, frameAttach, sizePayload(rows, cols)); err != nil {
+		t.Fatal(err)
+	}
+	c := &testClient{conn: conn}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	typ, payload, err := readFrame(conn)
+	if err != nil || typ != frameHello {
+		t.Fatalf("hello: %c %v", typ, err)
+	}
+	_ = json.Unmarshal(payload, &c.hello)
+	return c
+}
 
-	go func() {
-		conn, acceptErr := ln.Accept()
-		if acceptErr != nil {
+// readUntil collects output frames until want appears (or the session ends).
+func (c *testClient) readUntil(t *testing.T, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(c.out.String(), want) {
+		if c.exit != nil || c.gone {
+			t.Fatalf("session ended before %q; output %q", want, c.out.String())
+		}
+		_ = c.conn.SetReadDeadline(deadline)
+		typ, payload, err := readFrame(c.conn)
+		if err != nil {
+			t.Fatalf("waiting for %q: %v; output %q", want, err, c.out.String())
+		}
+		c.handle(typ, payload)
+	}
+}
+
+func (c *testClient) readToEnd(t *testing.T) {
+	t.Helper()
+	_ = c.conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for c.exit == nil && !c.gone {
+		typ, payload, err := readFrame(c.conn)
+		if err != nil {
+			c.gone = true
 			return
 		}
-		_, _ = conn.Write([]byte("short-lived output\n"))
-		_ = conn.Close()
-	}()
-
-	output, err := sessionPreviewOutput(sock)
-	if err != nil {
-		t.Fatalf("read closed session preview: %v", err)
-	}
-	if string(output) != "short-lived output\n" {
-		t.Fatalf("preview output = %q, want short-lived output", output)
+		c.handle(typ, payload)
 	}
 }
 
-func TestSessionDisplayLinesUseAlignedColumns(t *testing.T) {
-	short := sessionInfo{Sock: "/tmp/short.sock", Meta: sessionMeta{
-		Name:    "sh",
-		PWD:     "/work",
-		Command: []string{"sh"},
-	}}
-	long := sessionInfo{Sock: "/tmp/long.sock", Meta: sessionMeta{
-		Name:    "long-session-name",
-		PWD:     "/work/project",
-		Command: []string{"go", "run", "./cmd/worker"},
-	}}
-	shortFields := strings.Split(short.displayLine(100), "\t")
-	longFields := strings.Split(long.displayLine(100), "\t")
-	if len(shortFields) != 4 || len(longFields) != 4 {
-		t.Fatalf("display lines should have four tab-separated fields: %q / %q", shortFields, longFields)
-	}
-	for field := 1; field < 4; field++ {
-		if len(shortFields[field]) != len(longFields[field]) {
-			t.Fatalf("field %d is not aligned: %q / %q", field, shortFields[field], longFields[field])
-		}
-	}
-	if !strings.HasPrefix(shortFields[0], "/tmp/short.sock") || !strings.HasPrefix(longFields[0], "/tmp/long.sock") {
-		t.Fatal("socket path must remain the first field for attach and preview")
+func (c *testClient) handle(typ byte, payload []byte) {
+	switch typ {
+	case frameOutput:
+		c.out.Write(payload)
+	case frameExit:
+		c.exit = &exitInfo{}
+		_ = json.Unmarshal(payload, c.exit)
+	case frameDetach:
+		c.gone = true
 	}
 }
 
-func TestSessionDisplayLineKeepsSocketAndMetadataOrder(t *testing.T) {
-	line := (sessionInfo{Sock: "/tmp/session.sock", Meta: sessionMeta{
-		Name:    "shell",
-		PWD:     "/work",
-		Command: []string{"bash"},
-	}}).displayLine(100)
-	if !strings.HasPrefix(line, "/tmp/session.sock\t/work") {
-		t.Fatalf("display line = %q, want socket and directory first", line)
-	}
-}
-
-func TestParseAliasOutputBashAndZshFormats(t *testing.T) {
-	out := []byte("alias app='app -f /etc/app.conf'\nalias ls='ls --color=auto'\nll='ls -l'\nnot an alias line\n")
-	m := parseAliasOutput(out)
-	if m["app"] != "app -f /etc/app.conf" {
-		t.Fatalf("app = %q", m["app"])
-	}
-	if m["ls"] != "ls --color=auto" {
-		t.Fatalf("ls = %q", m["ls"])
-	}
-	if m["ll"] != "ls -l" {
-		t.Fatalf("ll = %q", m["ll"])
-	}
-	if _, ok := m["not"]; ok {
-		t.Fatal("non-alias line parsed as an alias")
-	}
-}
-
-func TestParseAliasOutputSkipsNoise(t *testing.T) {
-	out := []byte("\x1b[37C \x1b[1G banner\nsome random line\nx y = z\n")
-	m := parseAliasOutput(out)
-	if len(m) != 0 {
-		t.Fatalf("noise parsed as aliases: %v", m)
-	}
-}
-
-func TestUnquoteAliasValue(t *testing.T) {
-	if got := unquoteAliasValue(`'app -f /etc/app.conf'`); got != "app -f /etc/app.conf" {
-		t.Fatalf("single-quoted value = %q", got)
-	}
-	if got := unquoteAliasValue(`"a \"quoted\" word"`); got != `a "quoted" word` {
-		t.Fatalf("double-quoted value = %q", got)
-	}
-	if got := unquoteAliasValue(`'plain'\''quoted'`); got != "plain'quoted" {
-		t.Fatalf("embedded quote value = %q", got)
-	}
-	if got := unquoteAliasValue("plain"); got != "plain" {
-		t.Fatalf("unquoted value = %q", got)
-	}
-}
-
-func TestShellAliasCmdDetachesFromTerminal(t *testing.T) {
-	syscalls := shellAliasCmd(context.Background(), "/bin/sh").SysProcAttr
-	if syscalls == nil || !syscalls.Setsid {
-		t.Fatal("alias query must run in its own session to avoid SIGTTOU suspension")
-	}
-}
-
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
-}
-
-func TestUniqueSocketPathFitsPortableLimit(t *testing.T) {
-	dir := t.TempDir()
-	sock, err := uniqueSocketPath(dir, strings.Repeat("long-command-", 30))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(sock) > maxSocketPathLen {
-		t.Fatalf("socket path has %d bytes, want at most %d: %s", len(sock), maxSocketPathLen, sock)
-	}
-
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatalf("listen on generated socket path: %v", err)
-	}
-	_ = ln.Close()
-}
-
-func TestUniqueSocketPathRejectsLongDirectory(t *testing.T) {
-	dir := filepath.Join("/", strings.Repeat("x", maxSocketPathLen))
-	if _, err := uniqueSocketPath(dir, "session"); err == nil {
-		t.Fatal("expected an error for a session directory longer than the socket path limit")
-	}
-}
-
-func TestRunServerReplaysFastCommandOutput(t *testing.T) {
-	sh, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skip("sh is not available")
-	}
-
-	output := runServerAndRead(t, []string{sh, "-c", "printf quick-output"})
-	if !bytes.Contains(output, []byte("quick-output")) {
-		t.Fatalf("fast command output was not replayed: %q", output)
-	}
-}
-
-func TestRunServerKeepsPTYForDescendant(t *testing.T) {
-	output := runServerAndRead(t, []string{
-		os.Args[0],
-		"-test.run=^TestPTYDescendantHelper$",
-		"--",
-		"parent",
-	})
-	if !bytes.Contains(output, []byte("descendant-output")) {
-		t.Fatalf("descendant output was lost after its parent exited: %q", output)
-	}
-}
-
-func TestClosingClientsStillAllowsReattach(t *testing.T) {
-	server := &ptyServer{
-		clients:     map[net.Conn]struct{}{},
-		clientReady: make(chan struct{}),
-	}
-
-	first, firstPeer := net.Pipe()
-	defer firstPeer.Close()
-	if !server.add(first) {
-		t.Fatal("first client was rejected")
-	}
-	server.closeClients()
-	server.clientWG.Done()
-
-	second, secondPeer := net.Pipe()
-	defer secondPeer.Close()
-	if !server.add(second) {
-		t.Fatal("client was rejected after detaching existing clients")
-	}
-	server.shutdownClients()
-	server.clientWG.Done()
-
-	third, thirdPeer := net.Pipe()
-	defer thirdPeer.Close()
-	if server.add(third) {
-		t.Fatal("client was accepted after server shutdown")
-	}
-}
-
-func TestPTYDescendantHelper(t *testing.T) {
-	mode := helperMode(os.Args)
-	switch mode {
-	case "parent":
-		cmd := exec.Command(os.Args[0], "-test.run=^TestPTYDescendantHelper$", "--", "child")
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		if err := cmd.Start(); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(2)
-		}
-		os.Exit(0)
-	case "child":
-		time.Sleep(200 * time.Millisecond)
-		fmt.Fprint(os.Stdout, "descendant-output")
-		os.Exit(0)
-	}
-}
-
-func helperMode(args []string) string {
-	for i, arg := range args {
-		if arg == "--" && i+1 < len(args) {
-			return args[i+1]
-		}
-	}
-	return ""
-}
-
-func runServerAndRead(t *testing.T, command []string) []byte {
+func (c *testClient) send(t *testing.T, input string) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "session.sock")
-	done := make(chan error, 1)
-	go func() {
-		done <- runServer(append([]string{sock}, command...))
-	}()
-
-	if err := waitSocket(sock, serverStartWait); err != nil {
-		select {
-		case serverErr := <-done:
-			t.Fatalf("server exited before creating its socket: %v", serverErr)
-		default:
-		}
+	if err := writeFrame(c.conn, frameInput, []byte(input)); err != nil {
 		t.Fatal(err)
 	}
+}
 
-	conn, err := net.Dial("unix", sock)
+func runServerAndRead(t *testing.T, args []string) []byte {
+	t.Helper()
+	s := startTestServer(t, args...)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readToEnd(t)
+	s.waitExit(t)
+	return c.out.Bytes()
+}
+
+func TestServerPassesOutputThroughAndRestoresOnReattach(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `printf 'READY\n'; while read -r line; do printf '\033[32mgot:%s\033[0m\n' "$line"; done`)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "READY")
+	c.send(t, "hello\r")
+	c.readUntil(t, "\x1b[32mgot:hello\x1b[0m")
+	c.conn.Close()
+
+	st, err := querySession(s.sock, 0, 0)
+	if err != nil || st.Attached != 0 || st.Rows != 12 || st.Cols != 60 {
+		t.Fatalf("status after detach: %+v %v", st, err)
+	}
+
+	c2 := attachTestClient(t, s.sock, 10, 50)
+	c2.readUntil(t, "\x1b[?2026l")
+	host := newVTerm(10, 50)
+	host.Write(c2.out.Bytes())
+	if screen := strings.Join(captureState(host).rows, "\n"); !strings.Contains(screen, "got:hello") || !strings.Contains(screen, "READY") {
+		t.Fatalf("reattach snapshot screen:\n%s", screen)
+	}
+	if st, _ := querySession(s.sock, 0, 0); st.Rows != 10 || st.Cols != 50 || st.Attached != 1 {
+		t.Fatalf("reattach did not take the client size: %+v", st)
+	}
+	c2.send(t, "again\r")
+	c2.readUntil(t, "got:again")
+	c2.send(t, "\x04")
+	c2.readToEnd(t)
+	if c2.exit == nil || c2.exit.Code != 0 {
+		t.Fatalf("exit frame = %+v", c2.exit)
+	}
+	s.waitExit(t)
+}
+
+func TestServerKeepsExitedSessionUntilViewed(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `read -r x; printf 'final words\n'; exit 3`)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "\x1b[?2026l")
+	c.send(t, "go\r")
+	c.conn.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+	var st sessionStatus
+	for time.Now().Before(deadline) {
+		st, _ = querySession(s.sock, 6, 40)
+		if st.State == "exited" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if st.State != "exited" || st.ExitCode != 3 || !strings.Contains(st.Screen, "final words") {
+		t.Fatalf("status = %+v", st)
+	}
+	viewer := attachTestClient(t, s.sock, 12, 60)
+	if !viewer.hello.Exited {
+		t.Fatal("hello does not report the exit")
+	}
+	viewer.readToEnd(t)
+	if viewer.exit == nil || viewer.exit.Code != 3 || !strings.Contains(viewer.out.String(), "final words") {
+		t.Fatalf("viewer got exit=%+v output=%q", viewer.exit, viewer.out.String())
+	}
+	s.waitExit(t)
+}
+
+func TestServerStartsProgramAfterAttachSoQueriesReachTerminal(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `printf 'Q\033[6n'; IFS= read -r -d R reply; printf 'reply=%s\n' "$reply" | tr -d '\033'`)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "Q\x1b[6n")
+	c.send(t, "\x1b[7;9R")
+	c.readUntil(t, "reply=[7;9")
+	c.readToEnd(t)
+	s.waitExit(t)
+}
+
+func TestServerAnswersQueriesWhileDetached(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is not installed")
+	}
+	s := startTestServer(t, "bash", "-c", `sleep 0.3; printf 'ab\033[6n'; IFS= read -r -d R reply; printf 'reply=%s\n' "${reply#?}"; sleep 5`)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		st, err := querySession(s.sock, 5, 40)
+		if err == nil && strings.Contains(st.Screen, "reply=[1;3") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	st, _ := querySession(s.sock, 5, 40)
+	t.Fatalf("query was not answered while detached: %q", st.Screen)
+}
+
+func TestServerMarksBellWhileDetachedAsWaiting(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `read -r x; sleep 0.2; printf 'need input\a'; sleep 10`)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "\x1b[?2026l")
+	c.send(t, "\r")
+	c.conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if st, _ := querySession(s.sock, 0, 0); st.State == "waiting" {
+			c2 := attachTestClient(t, s.sock, 12, 60)
+			c2.readUntil(t, "\x1b[?2026l")
+			if st, _ := querySession(s.sock, 0, 0); st.State == "waiting" {
+				t.Fatal("attaching did not clear the attention flag")
+			}
+			_ = killSession(s.sock)
+			s.waitExit(t)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("bell while detached did not mark the session as waiting")
+}
+
+func TestServerKill(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `trap '' TERM; printf 'stubborn\n'; while :; do sleep 1; done`)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "stubborn")
+	if err := killSession(s.sock); err != nil {
+		t.Fatal(err)
+	}
+	c.readToEnd(t)
+	if c.exit == nil {
+		t.Fatal("attached client was not told the session ended")
+	}
+	s.waitExit(t)
+}
+
+func TestServerDetachAll(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `printf 'up\n'; sleep 10`)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "up")
+	if err := detachSession(s.sock); err != nil {
+		t.Fatal(err)
+	}
+	c.readToEnd(t)
+	if !c.gone || c.exit != nil {
+		t.Fatalf("client gone=%v exit=%v", c.gone, c.exit)
+	}
+	_ = killSession(s.sock)
+	s.waitExit(t)
+}
+
+func TestServerSwitchRequestMovesAttachedClients(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `printf 'shell\n'; sleep 10`)
+	if requestSwitch(s.sock, "/elsewhere.sock") {
+		t.Fatal("switch reported success with nobody attached")
+	}
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "shell")
+	target := filepath.Join(filepath.Dir(s.sock), "other.sock")
+	if !requestSwitch(s.sock, target) {
+		t.Fatal("switch request was not delivered")
+	}
+	_ = c.conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	for {
+		typ, payload, err := readFrame(c.conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if typ == frameSwitch {
+			if string(payload) != target {
+				t.Fatalf("switch target = %q", payload)
+			}
+			break
+		}
+	}
+	_ = killSession(s.sock)
+	s.waitExit(t)
+}
+
+func TestServerSupportsClientsFromOlderBuilds(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `printf 'legacy ok\n'; read -r x; printf 'echo:%s\n' "$x"`)
+	conn, err := dialSession(s.sock)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-
-	resize := make([]byte, 8)
-	binary.BigEndian.PutUint32(resize[:4], 24)
-	binary.BigEndian.PutUint32(resize[4:], 80)
-	if err := writeFrame(conn, frameResize, resize); err != nil {
+	if err := writeFrame(conn, frameResize, sizePayload(12, 60)); err != nil {
 		t.Fatal(err)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		t.Fatal(err)
+	_ = writeFrame(conn, frameInput, []byte("old\r"))
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	data, _ := io.ReadAll(conn)
+	if !strings.Contains(string(data), "echo:old") || data[0] != 0x1b {
+		t.Fatalf("legacy client stream = %q", data)
 	}
-	output, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("read server output: %v", err)
-	}
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("server exited with an error: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("server did not exit after the PTY closed")
-	}
-	return output
+	s.waitExit(t)
 }
 
-func TestRunWindowSizeBounceWaitsForHeavyRedrawFlush(t *testing.T) {
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-
-	tracker := newRedrawTracker()
-	stop := make(chan struct{})
-	defer close(stop)
-
-	var dst bytes.Buffer
-	outputDone := make(chan struct{})
-	go func() {
-		forwardSessionOutputWithTracker(&dst, clientConn, tracker)
-		close(outputDone)
-	}()
-
-	type resizeEvent struct {
-		rows uint16
-		cols uint16
-		at   time.Time
+func TestServerReportsMissingCommand(t *testing.T) {
+	out := runServerAndRead(t, []string{"/nonexistent/di-test-command"})
+	if !strings.Contains(string(out), "di: ") {
+		t.Fatalf("output = %q", out)
 	}
-	var events []resizeEvent
-	serverDone := make(chan error, 1)
+}
+
+func TestRunServerKeepsPTYForDescendant(t *testing.T) {
+	// Like a real terminal, the PTY stays open while a descendant that survived
+	// its parent's hangup still holds it.
+	out := runServerAndRead(t, []string{"sh", "-c", `trap '' HUP; (sleep 0.3; printf 'descendant\n') & printf 'parent\n'`})
+	if !strings.Contains(string(out), "descendant") {
+		t.Fatalf("output = %q", out)
+	}
+}
+
+func TestQuerySessionReadsOlderServers(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "old.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
 	go func() {
-		defer close(serverDone)
-		// Initial history burst (no full screen clear).
-		_, _ = serverConn.Write([]byte("initial-viewport\r\n"))
-		for i := 0; i < 2; i++ {
-			typ, payload, err := readFrame(serverConn)
+		for {
+			conn, err := ln.Accept()
 			if err != nil {
-				serverDone <- err
 				return
 			}
-			if typ != frameResize || len(payload) != 8 {
-				serverDone <- fmt.Errorf("unexpected frame %c len=%d", typ, len(payload))
-				return
-			}
-			rows := uint16(binary.BigEndian.Uint32(payload[:4]))
-			cols := uint16(binary.BigEndian.Uint32(payload[4:]))
-			events = append(events, resizeEvent{rows: rows, cols: cols, at: time.Now()})
-			// Simulate heavy agy render (~180ms CPU before \x1b[2J, 60ms stream flush).
-			time.Sleep(180 * time.Millisecond)
-			_, _ = serverConn.Write([]byte(fmt.Sprintf("\x1b[?25l\x1b[2J\x1b[Hscrollback-cols-%d\r\n", cols)))
-			time.Sleep(60 * time.Millisecond)
-			_, _ = serverConn.Write([]byte(fmt.Sprintf("viewport-cols-%d\x1b[?25h", cols)))
+			_, _ = io.WriteString(conn, "\x1b]7502;vterm=1;snap=begin;rows=6;cols=30\x07\x1b[H\x1b[2Jold session text\r\n\x1b]7501;state=working\x07\x1b]7502;snap=end\x07")
+			time.Sleep(50 * time.Millisecond)
+			conn.Close()
 		}
-		_ = serverConn.Close()
 	}()
-
-	runWindowSizeBounce(clientConn, 41, 94, tracker, stop)
-	if err := <-serverDone; err != nil {
-		t.Fatalf("server error: %v", err)
-	}
-	<-outputDone
-
-	if len(events) != 2 {
-		t.Fatalf("got %d resize events, want 2", len(events))
-	}
-	if events[0].rows != 41 || events[0].cols != 93 {
-		t.Fatalf("first resize = %dx%d, want 41x93", events[0].rows, events[0].cols)
-	}
-	if events[1].rows != 41 || events[1].cols != 94 {
-		t.Fatalf("second resize = %dx%d, want 41x94", events[1].rows, events[1].cols)
-	}
-	if gap := events[1].at.Sub(events[0].at); gap < 240*time.Millisecond {
-		t.Fatalf("second resize sent after %v, before first 240ms heavy redraw finished flushing", gap)
-	}
-	out := dst.String()
-	if !strings.Contains(out, "scrollback-cols-94") || !strings.Contains(out, "viewport-cols-94") {
-		t.Fatalf("restored width redraw missing from output: %q", out)
+	st, err := querySession(sock, 4, 30)
+	if err != nil || !st.Legacy || st.State != "busy" || !strings.Contains(st.Screen, "old session text") || st.Cols != 30 {
+		t.Fatalf("legacy status = %+v, %v", st, err)
 	}
 }
 
-func TestTrimHistorySliceStartsAtLineBoundary(t *testing.T) {
-	raw := []byte("a52e824;file:///home/c/veloren/foo.rs\x07foo.rs\x1b]8;;\x07\r\nclean-line-start\r\n")
-	trimmed := string(trimHistorySlice(raw))
-	if trimmed != "clean-line-start\r\n" {
-		t.Fatalf("trimHistorySlice = %q, want %q", trimmed, "clean-line-start\r\n")
-	}
-}
+// ---- attach client in a real pty ----
 
-func TestFullScreenScrollbackDumpIsNotWrappedInSyncOutput(t *testing.T) {
-	dump := []byte("\x1b[?25l\x1b[2J\x1b[3J\x1b[Hline-1\r\n\x1b[Kline-2\r\n\x1b[J\x1b[?25h")
-	if shouldWrapSyncOutput(dump) {
-		t.Fatal("full-screen scrollback dump should not be wrapped in DEC 2026 synchronized output")
-	}
-	inPlace := []byte("\x1b[?25l\r\x1b[12A\x1b[Kline-1\r\n\x1b[J\x1b[?25h")
-	if !shouldWrapSyncOutput(inPlace) {
-		t.Fatal("in-place cursor-up redraw should be wrapped in DEC 2026 synchronized output")
-	}
-}
-
-func TestInPlaceCompactorStripsUnchangedTopLinesAndSkipsDuplicateFrames(t *testing.T) {
-	var c inPlaceCompactor
-	frame1 := []byte("\x1b[?25l\x1b[?7l\r\x1b[3A\x1b[Jtop-0\r\ntop-1\r\nspin-1\r\nstatus-1\x1b[?7h\x1b[?25h")
-	out1, skip1 := c.compact(frame1)
-	if skip1 || !bytes.Equal(out1, frame1) {
-		t.Fatalf("first frame should pass through unchanged: skip=%v out=%q", skip1, out1)
-	}
-
-	// Exact duplicate frame should be skipped completely.
-	_, skipDup := c.compact(frame1)
-	if !skipDup {
-		t.Fatal("identical consecutive in-place frame should be skipped")
-	}
-
-	// Frame where top-0 and top-1 are unchanged, and only spin-2 + status-2 change.
-	frame2 := []byte("\x1b[?25l\x1b[?7l\r\x1b[3A\x1b[Jtop-0\r\ntop-1\r\nspin-2\r\nstatus-2\x1b[?7h\x1b[?25h")
-	out2, skip2 := c.compact(frame2)
-	if skip2 {
-		t.Fatal("changed frame must not be skipped")
-	}
-	if bytes.Contains(out2, []byte("top-0")) || bytes.Contains(out2, []byte("top-1")) {
-		t.Fatalf("compacted frame still contained unchanged top lines: %q", out2)
-	}
-	if !bytes.Contains(out2, []byte("\r\x1b[1A\x1b[Jspin-2\r\nstatus-2")) {
-		t.Fatalf("compacted frame did not adjust cursor-up count to 1 with \\x1b[J clear: %q", out2)
-	}
-	if !shouldWrapSyncOutput(out2) {
-		t.Fatalf("compacted frame should still qualify for DEC 2026 synchronized output: %q", out2)
-	}
-
-	// Full clear resets compactor state.
-	_, _ = c.compact([]byte("\x1b[2J\x1b[3J\x1b[Hfull-reset"))
-	out3, skip3 := c.compact(frame2)
-	if skip3 || !bytes.Equal(out3, frame2) {
-		t.Fatalf("frame after full clear should not be diffed against pre-clear state: skip=%v out=%q", skip3, out3)
-	}
-}
-
-func TestVTermAndBlitEncoderDiffsInPlaceSpinnerWithoutFlickerOrClears(t *testing.T) {
-	var out bytes.Buffer
-	r := newClientSessionRenderer(&out, 10, 60, nil)
-	defer r.Close()
-
-	// Push 25 lines into scrollback + 10 lines on screen.
-	var initBuf bytes.Buffer
-	for i := 1; i <= 35; i++ {
-		fmt.Fprintf(&initBuf, "history-line-%02d\r\n", i)
-	}
-	if err := r.ProcessChunk(initBuf.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	if r.vt.ScrollbackLen() < 25 {
-		t.Fatalf("scrollback len = %d, want >= 25", r.vt.ScrollbackLen())
-	}
-
-	// Simulate an agy-style 9-line in-place redraw frame.
-	buildFrame := func(tick int) []byte {
-		var b bytes.Buffer
-		b.WriteString("\x1b[?25l\r\x1b[8A\x1b[J")
-		for i := 1; i <= 7; i++ {
-			fmt.Fprintf(&b, "conversation-row-%d\r\n", i)
-		}
-		fmt.Fprintf(&b, "⠋ Running tool tick-%d\r\n", tick)
-		b.WriteString("? for shortcuts\x1b[?25h")
-		return b.Bytes()
-	}
-
-	if err := r.ProcessChunk(buildFrame(1)); err != nil {
-		t.Fatal(err)
-	}
-	out.Reset()
-
-	// Exact duplicate redraw must emit 0 bytes to the terminal.
-	if err := r.ProcessChunk(buildFrame(1)); err != nil {
-		t.Fatal(err)
-	}
-	if out.Len() != 0 {
-		t.Fatalf("duplicate redraw emitted %d bytes, want 0: %q", out.Len(), out.String())
-	}
-
-	// Next spinner tick only changes "tick-1" -> "tick-2" (1 character!).
-	if err := r.ProcessChunk(buildFrame(2)); err != nil {
-		t.Fatal(err)
-	}
-	diff := out.String()
-	if !strings.HasPrefix(diff, "\x1b[?2026h") || !strings.Contains(diff, "\x1b[?2026l") {
-		t.Fatalf("diff update not wrapped in DEC 2026 sync markers: %q", diff)
-	}
-	if strings.Contains(diff, "\x1b[2J") || strings.Contains(diff, "\x1b[3J") {
-		t.Fatalf("diff update must not clear screen or scrollback: %q", diff)
-	}
-	if strings.Contains(diff, "conversation-row-1") {
-		t.Fatalf("diff update re-emitted unchanged conversation rows: %q", diff)
-	}
-	if r.vt.ScrollbackLen() < 25 {
-		t.Fatalf("scrollback lost after in-place spinner redraws: got %d", r.vt.ScrollbackLen())
-	}
-}
-
-func TestVTermPreservesScrollbackAcrossBare3JAndReplacesOnFullDump(t *testing.T) {
-	vt := newVTerm(6, 40)
-	for i := 1; i <= 20; i++ {
-		vt.Write([]byte(fmt.Sprintf("scroll-row-%02d\r\n", i)))
-	}
-	initialSB := vt.ScrollbackLen()
-	if initialSB < 14 {
-		t.Fatalf("initial scrollback = %d, want >= 14", initialSB)
-	}
-
-	// 1. Bare \x1b[2J\x1b[3J\x1b[H followed by only a 3-line screen (no history re-dump).
-	vt.Write([]byte("\x1b[?25l\x1b[2J\x1b[3J\x1b[Hscreen-only-1\r\nscreen-only-2\x1b[?25h"))
-	if vt.ScrollbackLen() < initialSB {
-		t.Fatalf("bare \\x1b[3J destroyed scrollback: got %d, want >= %d", vt.ScrollbackLen(), initialSB)
-	}
-
-	// 2. Full history re-dump on resize (\x1b[2J\x1b[3J\x1b[H + 20 fresh lines).
-	var dump bytes.Buffer
-	dump.WriteString("\x1b[?25l\x1b[2J\x1b[3J\x1b[H")
-	for i := 1; i <= 20; i++ {
-		fmt.Fprintf(&dump, "rewrapped-row-%02d\r\n", i)
-	}
-	dump.WriteString("\x1b[?25h")
-	vt.Write(dump.Bytes())
-
-	if !vt.ConsumeFullScrollbackReplaced() {
-		t.Fatal("expected fullScrollbackReplaced=true after full history dump")
-	}
-	lines := vt.DetectionLines(50)
-	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "rewrapped-row-01") {
-		t.Fatalf("missing rewrapped scrollback after full dump: %q", joined)
-	}
-	if strings.Contains(joined, "scroll-row-01") {
-		t.Fatalf("old scrollback was duplicated after full dump: %q", joined)
-	}
-}
-
-func TestVTermRecoversScrolledOffLinesFromInPlaceSlidingWindowRedraw(t *testing.T) {
-	vt := newVTerm(6, 40)
-	vt.Write([]byte("\x1b[Hline-A\r\nline-B\r\nline-C\r\nline-D\r\nline-E\r\nline-F"))
-	if vt.ScrollbackLen() != 0 {
-		t.Fatalf("expected 0 initial scrollback, got %d", vt.ScrollbackLen())
-	}
-
-	// Shift content up by 2 lines in-place using \x1b[H without bottom linefeeds.
-	vt.Write([]byte("\x1b[H\x1b[2Kline-C\r\n\x1b[2Kline-D\r\n\x1b[2Kline-E\r\n\x1b[2Kline-F\r\n\x1b[2Kline-G\r\n\x1b[2Kline-H"))
-	if vt.ScrollbackLen() != 2 {
-		t.Fatalf("sliding window scrollback len = %d, want 2", vt.ScrollbackLen())
-	}
-	all := strings.Join(vt.DetectionLines(20), "\n")
-	if !strings.Contains(all, "line-A") || !strings.Contains(all, "line-B") {
-		t.Fatalf("scrolled-off top lines were not recovered into scrollback: %q", all)
-	}
-}
-
-func TestVTermWideCJKOverwriteAndScrollbarOverlay(t *testing.T) {
-	var out bytes.Buffer
-	r := newClientSessionRenderer(&out, 6, 20, nil)
-	defer r.Close()
-
-	for i := 1; i <= 15; i++ {
-		_ = r.ProcessChunk([]byte(fmt.Sprintf("历史记录第%02d行\r\n", i)))
-	}
-	// Overwrite second column of wide character '历' at row 0 col 0 with ASCII 'X'.
-	_ = r.ProcessChunk([]byte("\x1b[1;2HX"))
-	row0 := r.vt.ViewportRow(0).plainText()
-	if !strings.HasPrefix(row0, " X史记录") {
-		t.Fatalf("wide character orphan half was not cleared on overwrite: %q", row0)
-	}
-
-	out.Reset()
-	// Press PageUp (\x1b[5~) to scroll back into history.
-	if !r.HandleInput([]byte("\x1b[5~")) {
-		t.Fatal("PageUp should be consumed by scrollback viewport")
-	}
-	if !r.vt.IsScrolledBack() {
-		t.Fatal("vterm should be in scrolled-back state after PageUp")
-	}
-	scrolledOut := out.String()
-	if !strings.ContainsRune(scrolledOut, scrollbarTrackChar) && !strings.ContainsRune(scrolledOut, scrollbarThumbChar) {
-		t.Fatalf("scrolled view did not render herdr scrollbar characters: %q", scrolledOut)
-	}
-
-	// Normal keystroke snaps scrollback back to 0 and is not consumed.
-	if r.HandleInput([]byte("a")) {
-		t.Fatal("normal keystroke should be forwarded to session")
-	}
-	if r.vt.IsScrolledBack() {
-		t.Fatal("normal keystroke should reset scrollOffset to 0")
-	}
-}
-
-func TestCursorSettleDebouncesTransientJumpsAndHides(t *testing.T) {
-	cs := newCursorSettleState()
-	t0 := time.Now()
-
-	// Initial position settles immediately at preferredRow=5, col=10.
-	r, c, vis := cs.Observe(5, 10, true, t0)
-	if r != 5 || c != 10 || !vis {
-		t.Fatalf("initial settle = (%d,%d,%v), want (5,10,true)", r, c, vis)
-	}
-
-	// Transient cursor hide (\x1b[?25l) during redraw is held visible for 100ms.
-	_, _, vis = cs.Observe(0, 0, false, t0.Add(5*time.Millisecond))
-	if !vis {
-		t.Fatal("transient cursor hide should be held visible during redraw")
-	}
-
-	// Transient jump to row 1 during redraw holds settled position (5, 10).
-	r, c, vis = cs.Observe(1, 2, true, t0.Add(10*time.Millisecond))
-	if r != 5 || c != 10 || !vis {
-		t.Fatalf("transient row jump = (%d,%d,%v), want held (5,10,true)", r, c, vis)
-	}
-
-	// After 100ms hold deadline expires, cursor advances to (1, 2).
-	if !cs.Advance(t0.Add(120 * time.Millisecond)) {
-		t.Fatal("expected CursorSettleState.Advance to report change after deadline")
-	}
-	r, c, vis = cs.Observe(1, 2, true, t0.Add(120*time.Millisecond))
-	if r != 1 || c != 2 || !vis {
-		t.Fatalf("post-deadline settle = (%d,%d,%v), want (1,2,true)", r, c, vis)
-	}
-}
-
-func TestPTYServerPreservesScrollbackAcrossFullClearsOnReattach(t *testing.T) {
-	s := &ptyServer{
-		clients:     map[net.Conn]struct{}{},
-		clientReady: make(chan struct{}),
-		lastRows:    6,
-		lastCols:    40,
-	}
-	for i := 1; i <= 15; i++ {
-		s.appendHistory([]byte(fmt.Sprintf("pre-clear-scroll-%02d\r\n", i)))
-	}
-	// Full screen clear wipes s.history, but s.vt retains all scrollback lines!
-	s.appendHistory([]byte("\x1b[2J\x1b[Hpost-clear-screen-line"))
-
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-
-	var replay bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(&replay, clientConn)
-		close(done)
-	}()
-
-	if !s.add(serverConn) {
-		t.Fatal("s.add rejected connection")
-	}
-	_ = serverConn.Close()
-	s.clientWG.Done()
-	<-done
-
-	var clientOut bytes.Buffer
-	renderer := newClientSessionRenderer(&clientOut, 6, 40, nil)
-	defer renderer.Close()
-	if err := renderer.ProcessChunk(replay.Bytes()); err != nil {
-		t.Fatal(err)
-	}
-	if !renderer.HasServerScrollback() {
-		t.Fatal("client renderer did not detect server vterm scrollback")
-	}
-	lines := strings.Join(renderer.vt.DetectionLines(30), "\n")
-	if !strings.Contains(lines, "pre-clear-scroll-01") || !strings.Contains(lines, "post-clear-screen-line") {
-		t.Fatalf("reattached client missing pre-clear scrollback or post-clear screen: %q", lines)
-	}
-}
-
-func TestLightOSWebShellSameSizeSIGWINCHRepaintsFullScrollbackFromVTerm(t *testing.T) {
-	var out bytes.Buffer
-	r := newClientSessionRenderer(&out, 6, 40, nil)
-	defer r.Close()
-
-	for i := 1; i <= 15; i++ {
-		_ = r.ProcessChunk([]byte(fmt.Sprintf("webshell-scroll-%02d\r\n", i)))
-	}
-	_ = r.ProcessChunk([]byte("webshell-active-prompt"))
-	out.Reset()
-
-	// Simulate LightOS WebShell reopen with identical 6x40 dimensions.
-	sizeChanged, hasScrollback, err := r.ResizeAndRepaint(6, 40)
+func TestAttachClientDetachesAndRestoresTerminal(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `printf '\033[?2004h\033[>1u\033[?1049hFULLSCREEN\n'; sleep 30`)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAttachClientHelper$")
+	cmd.Env = append(os.Environ(), "DI_ATTACH_TEST_SOCK="+s.sock, "D_DETACH=^]")
+	master, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 12, Cols: 60})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sizeChanged {
-		t.Fatal("expected sizeChanged=false for identical 6x40 dimensions")
-	}
-	if !hasScrollback {
-		t.Fatal("expected hasScrollback=true")
-	}
-	repainted := out.String()
-	if !strings.Contains(repainted, "webshell-scroll-01") || !strings.Contains(repainted, "webshell-active-prompt") {
-		t.Fatalf("same-size WebShell reopen did not repaint full scrollback and screen: %q", repainted)
-	}
-
-	// Verify by replaying into an independent host terminal (simulating LightOS ghostty-vt.wasm)
-	// that all 10 scrollback rows actually scrolled off into native scrollback and were not overwritten by CUP!
-	hostVT := newVTerm(6, 40)
-	hostVT.Write(out.Bytes())
-	if hostVT.ScrollbackLen() != r.vt.ScrollbackLen() {
-		t.Fatalf("host native scrollback len = %d, want %d", hostVT.ScrollbackLen(), r.vt.ScrollbackLen())
-	}
-	for i := 0; i < 6; i++ {
-		if got, want := hostVT.ViewportRow(i).plainText(), r.vt.ViewportRow(i).plainText(); got != want {
-			t.Fatalf("host viewport row %d = %q, want %q", i, got, want)
-		}
-	}
-}
-
-func TestAstraP1AltScreenShrinkAndRestoreNoPanic(t *testing.T) {
-	vt := newVTerm(6, 8)
-	vt.Write([]byte("\x1b[6;8HX\x1b[?1049h"))
-	vt.Resize(2, 4)
-	// Returning from alternate screen after shrinking must clamp saved cursor and not panic.
-	vt.Write([]byte("\x1b[?1049lY\x1b[K"))
-	if vt.InAltScreen() {
-		t.Fatal("expected primary screen after ?1049l")
-	}
-	rows, cols := vt.Size()
-	if rows != 2 || cols != 4 {
-		t.Fatalf("size = %dx%d, want 2x4", rows, cols)
-	}
-
-	// Mode 47 retains alt screen content across exit and re-entry.
-	vt47 := newVTerm(4, 10)
-	vt47.Write([]byte("\x1b[?47h\x1b[1;1HALT47\x1b[?47l\x1b[?47h"))
-	if got := vt47.ViewportRow(0).plainText(); got != "ALT47" {
-		t.Fatalf("mode 47 did not retain alt screen content: got %q, want ALT47", got)
-	}
-
-	// Multi-parameter DECSET/DECRST applies subsequent params to the newly switched screen.
-	vtMulti := newVTerm(4, 10)
-	vtMulti.Write([]byte("\x1b[?1049h\x1b[?1049;25l"))
-	if vtMulti.InAltScreen() {
-		t.Fatal("expected primary screen after ?1049;25l")
-	}
-	if vtMulti.primary.cursorVis {
-		t.Fatal("expected primary cursorVis=false after ?1049;25l")
-	}
-}
-
-func TestAstraP1LargeCSIParamsNoOverflowOrCrash(t *testing.T) {
-	vt := newVTerm(6, 10)
-	vt.Write([]byte("\x1b[2;1H\x1b[9223372036854775807B\x1b[K"))
-	vt.Write([]byte("\x1b[9223372036854775807E\x1b[9223372036854775807C\x1b[9223372036854775807X"))
-	vt.Write([]byte("\x1b[9223372036854775807@\x1b[9223372036854775807P"))
-	if vt.primary.curR < 0 || vt.primary.curR >= 6 || vt.primary.curC < 0 || vt.primary.curC >= 10 {
-		t.Fatalf("cursor out of bounds after huge CSI params: (%d,%d)", vt.primary.curR, vt.primary.curC)
-	}
-
-	// CSI with intermediate (CSI 1 SP @) must not execute ICH.
-	vt2 := newVTerm(2, 6)
-	vt2.Write([]byte("ABCD\r\x1b[1 @"))
-	if got := vt2.ViewportRow(0).plainText(); got != "ABCD" {
-		t.Fatalf("CSI 1 SP @ falsely executed ICH: got %q, want ABCD", got)
-	}
-
-	// CAN (0x18) cancels an in-progress CSI sequence.
-	vt2.Write([]byte("\x1b[31\x18mZ"))
-	if vt2.primary.grid[0].cells[0].style.fg.kind != vtermColorDefault {
-		t.Fatal("CAN did not cancel in-progress CSI SGR sequence")
-	}
-}
-
-type yieldWriter struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (w *yieldWriter) Write(p []byte) (int, error) {
-	if len(p) > 2 {
-		w.mu.Lock()
-		w.buf.Write(p[:2])
-		w.mu.Unlock()
-		time.Sleep(time.Millisecond)
-		w.mu.Lock()
-		w.buf.Write(p[2:])
-		w.mu.Unlock()
-		return len(p), nil
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.buf.Write(p)
-}
-
-func TestAstraP1ConcurrentWriteFrameAtomicity(t *testing.T) {
-	w := &yieldWriter{}
-	done := make(chan struct{})
+	defer master.Close()
+	var output bytes.Buffer
+	readDone := make(chan struct{})
+	sentDetach := false
 	go func() {
-		defer close(done)
-		for i := 0; i < 20; i++ {
-			_ = writeFrame(w, frameInput, []byte("hello-world"))
+		defer close(readDone)
+		buf := make([]byte, 4096)
+		for {
+			n, err := master.Read(buf)
+			output.Write(buf[:n])
+			if !sentDetach && bytes.Contains(output.Bytes(), []byte("FULLSCREEN")) {
+				sentDetach = true
+				_, _ = master.Write([]byte("\x1b[93;5u"))
+			}
+			if err != nil {
+				return
+			}
 		}
 	}()
-	for i := 0; i < 20; i++ {
-		_ = writeResizeFrame(w, 24+i, 80+i)
-	}
-	<-done
-
-	r := bytes.NewReader(w.buf.Bytes())
-	count := 0
-	for r.Len() > 0 {
-		typ, payload, err := readFrame(r)
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case err := <-waitDone:
 		if err != nil {
-			t.Fatalf("frame %d corrupted: %v", count, err)
+			t.Fatalf("attach client: %v", err)
 		}
-		switch typ {
-		case frameInput:
-			if string(payload) != "hello-world" {
-				t.Fatalf("input payload = %q, want hello-world", payload)
-			}
-		case frameResize:
-			if len(payload) != 8 {
-				t.Fatalf("resize payload len = %d, want 8", len(payload))
-			}
-		default:
-			t.Fatalf("unexpected frame type %q", typ)
-		}
-		count++
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("attach did not exit; output %q", output.String())
 	}
-	if count != 40 {
-		t.Fatalf("read %d frames, want 40", count)
+	<-readDone
+	out := output.String()
+	full := strings.LastIndex(out, "FULLSCREEN")
+	restore := strings.LastIndex(out, "\x1b[<1u")
+	if full < 0 || restore < full || !strings.Contains(out[restore-20:], "\x1b[?1049l") || !strings.Contains(out[restore:], "\x1b[?2004l") {
+		t.Fatalf("missing ordered mode restore: %q", out)
 	}
+	if !strings.Contains(out, "[di] detached") {
+		t.Fatalf("missing detach message: %q", out)
+	}
+	if st, err := querySession(s.sock, 0, 0); err != nil || st.Attached != 0 {
+		t.Fatalf("session after detach: %+v %v", st, err)
+	}
+	_ = killSession(s.sock)
+	s.waitExit(t)
 }
 
-func TestAstraP1BlitEncoderFullAndDiffNativeScrollbackFidelity(t *testing.T) {
-	var out bytes.Buffer
-	r := newClientSessionRenderer(&out, 3, 10, nil)
-	defer r.Close()
-	hostVT := newVTerm(3, 10)
-
-	// 1. Initial 3 rows: A, B, C
-	_ = r.ProcessChunk([]byte("A\r\nB\r\nC"))
-	hostVT.Write(out.Bytes())
-	out.Reset()
-
-	// 2. Push 3 rows at once (len(pushed) >= rows): D, E, F
-	_ = r.ProcessChunk([]byte("\r\nD\r\nE\r\nF"))
-	hostVT.Write(out.Bytes())
-	out.Reset()
-
-	if hostVT.ScrollbackLen() != 3 {
-		t.Fatalf("host scrollback len = %d, want 3", hostVT.ScrollbackLen())
+func TestAttachClientHelper(t *testing.T) {
+	sock := os.Getenv("DI_ATTACH_TEST_SOCK")
+	if sock == "" {
+		return
 	}
-	wantSB := []string{"A", "B", "C"}
-	gotSB := hostVT.effectiveScrollback()
-	for i, w := range wantSB {
-		if got := gotSB[i].plainText(); got != w {
-			t.Fatalf("host scrollback[%d] = %q, want %q", i, got, w)
-		}
-	}
-	wantVP := []string{"D", "E", "F"}
-	for i, w := range wantVP {
-		if got := hostVT.ViewportRow(i).plainText(); got != w {
-			t.Fatalf("host viewport[%d] = %q, want %q", i, got, w)
-		}
-	}
-
-	// 3. Colored row followed by blank row in encodeFull must not bleed background color into row 2.
-	var out2 bytes.Buffer
-	r2 := newClientSessionRenderer(&out2, 2, 5, nil)
-	defer r2.Close()
-	_ = r2.ProcessChunk([]byte("\x1b[41mA\x1b[0m"))
-	hostVT2 := newVTerm(2, 5)
-	hostVT2.Write(out2.Bytes())
-	if hostVT2.primary.grid[1].cells[0].style.bg.kind != vtermColorDefault {
-		t.Fatalf("row 2 background bled from row 1: %+v", hostVT2.primary.grid[1].cells[0].style.bg)
-	}
-}
-
-func TestAstraP1SnapshotANSIPreservesAltScreenSGRMarginsAndNoDuplicateScrollback(t *testing.T) {
-	s := &ptyServer{
-		clients:     map[net.Conn]struct{}{},
-		clientReady: make(chan struct{}),
-		lastRows:    6,
-		lastCols:    40,
-	}
-	for i := 1; i <= 10; i++ {
-		s.appendHistory([]byte(fmt.Sprintf("hist-line-%02d\r\n", i)))
-	}
-	// Historical bell, valid OSC 52, and oversized OSC 52 (> 256 KB).
-	oversized := strings.Repeat("A", 300*1024)
-	s.appendHistory([]byte("\x07\x1b]52;c;aGVsbG8=\x07\x1b]52;c;" + oversized + "\x07"))
-	// Enter alt screen, set red fg, and clear screen (which truncates s.history).
-	s.appendHistory([]byte("\x1b[?1049h\x1b[31m\x1b[2J\x1b[Halt-red-text"))
-
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
-
-	var replay bytes.Buffer
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(&replay, clientConn)
-		close(done)
-	}()
-
-	if !s.add(serverConn) {
-		t.Fatal("s.add rejected connection")
-	}
-	_ = serverConn.Close()
-	s.clientWG.Done()
-	<-done
-
-	if bytes.Contains(replay.Bytes(), []byte("\x1b]52;")) {
-		t.Fatal("reattach snapshot must not replay historical OSC 52 clipboard writes")
-	}
-
-	// Replay into a taller client (12x40) to verify snapshot geometry negotiation!
-	var clientOut bytes.Buffer
-	renderer := newClientSessionRenderer(&clientOut, 12, 40, nil)
-	defer renderer.Close()
-	if err := renderer.ProcessChunk(replay.Bytes()); err != nil {
+	if err := attachSession(sock); err != nil {
 		t.Fatal(err)
 	}
-	if !renderer.vt.InAltScreen() {
-		t.Fatal("reattached client did not restore alternate screen state")
+}
+
+// ---- session files ----
+
+func TestUniqueSocketPathFitsPortableLimit(t *testing.T) {
+	base, err := os.MkdirTemp("", "u")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := renderer.vt.ViewportRow(0).plainText(); got != "alt-red-text" {
-		t.Fatalf("alt screen row 0 = %q, want alt-red-text", got)
+	defer os.RemoveAll(base)
+	dir := filepath.Join(base, strings.Repeat("d", 20))
+	sock, err := uniqueSocketPath(dir, strings.Repeat("label-", 30))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Write one more char and verify active red SGR was preserved across snapshot!
-	_ = renderer.ProcessChunk([]byte("!"))
-	if renderer.vt.alt.grid[0].cells[12].style.fg.index != 1 {
-		t.Fatalf("active SGR color not preserved across snapshot: %+v", renderer.vt.alt.grid[0].cells[12].style.fg)
+	if len(sock) > maxSocketPathLen {
+		t.Fatalf("socket path is %d bytes", len(sock))
 	}
-	// Exit alt screen and verify primary scrollback has no duplicate lines.
-	_ = renderer.ProcessChunk([]byte("\x1b[?1049l"))
-	allLines := renderer.vt.DetectionLines(50)
-	count01 := 0
-	for _, l := range allLines {
-		if l == "hist-line-01" {
-			count01++
-		}
-	}
-	if count01 != 1 {
-		t.Fatalf("hist-line-01 appeared %d times, want 1 (lines=%v)", count01, allLines)
+	if got := cleanSessionName("", sock); !strings.HasPrefix(got, "label-") || strings.ContainsAny(got, "0123456789") {
+		t.Fatalf("clean name = %q", got)
 	}
 }
 
-func TestAstraP1DEC2026SplitChunkSuppressesIntermediateRender(t *testing.T) {
-	var out bytes.Buffer
-	r := newClientSessionRenderer(&out, 4, 20, nil)
-	defer r.Close()
-
-	// Chunk 1 opens ?2026h without closing ?2026l.
-	if err := r.ProcessChunk([]byte("\x1b[?2026h\x1b[Hpartial-frame")); err != nil {
-		t.Fatal(err)
-	}
-	if out.Len() != 0 {
-		t.Fatalf("intermediate DEC 2026 chunk was rendered prematurely: %q", out.String())
-	}
-
-	// Chunk 2 completes the frame and closes ?2026l.
-	if err := r.ProcessChunk([]byte("\r\ncompleted-frame\x1b[?2026l")); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), "completed-frame") {
-		t.Fatalf("completed DEC 2026 frame was not rendered: %q", out.String())
+func TestUniqueSocketPathRejectsLongDirectory(t *testing.T) {
+	if _, err := uniqueSocketPath("/"+strings.Repeat("x", 120), "label"); err == nil {
+		t.Fatal("expected error for long directory")
 	}
 }
 
-func TestAstraP1TerminalQueriesAndSplitDECRQM(t *testing.T) {
-	vt := newVTerm(10, 40)
-	// Split DECRQM ?2026$p across two Write calls, plus DSR 6n, DSR 5n, DA1, DA2, Kitty ?u.
-	vt.Write([]byte("\x1b[3;7H\x1b[?20"))
-	vt.Write([]byte("26$p\x1b[6n\x1b[5n\x1b[c\x1b[>c\x1b[>5u\x1b[?u"))
-	replies := string(vt.DrainReplies())
-	for _, want := range []string{
-		"\x1b[?2026;2$y",
-		"\x1b[3;7R",
-		"\x1b[0n",
-		"\x1b[?62;22c",
-		"\x1b[>1;10;0c",
-		"\x1b[?5u",
+func TestCleanSessionName(t *testing.T) {
+	for in, want := range map[string]string{
+		"agy---dangerously-skip-permissions-dmii0el5j50w-3531216": "agy",
+		"codex---yolo-dmkr3kzx61zd-3313217":                       "codex---yolo",
+		"make-test-dmkr3kzx61zd-12-1":                             "make-test",
 	} {
-		if !strings.Contains(replies, want) {
-			t.Fatalf("replies %q missing %q", replies, want)
+		if got := cleanSessionName(in, ""); got != want {
+			t.Errorf("cleanSessionName(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
 
-func TestAstraP2WideCharsICHDCHCombiningAndDECSpecialGraphics(t *testing.T) {
-	// 1. Combining mark attaches to base cell without advancing column.
+func TestResolveSession(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	sessions := filepath.Join(dir, "di")
+	_ = os.MkdirAll(sessions, 0o700)
+	for _, name := range []string{"codex---yolo-aaaaaaaaaa-1", "claude-bbbbbbbbbb-2", "claude-cccccccccc-3"} {
+		ln, err := net.Listen("unix", filepath.Join(sessions, name+".sock"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+	}
+	if got, err := resolveSession("codex"); err != nil || sessionName(got) != "codex---yolo-aaaaaaaaaa-1" {
+		t.Fatalf("prefix: %q %v", got, err)
+	}
+	if got, err := resolveSession("cccc"); err != nil || sessionName(got) != "claude-cccccccccc-3" {
+		t.Fatalf("substring: %q %v", got, err)
+	}
+	if _, err := resolveSession("claude"); err == nil || !strings.Contains(err.Error(), "several") {
+		t.Fatalf("ambiguous: %v", err)
+	}
+	if _, err := resolveSession("nope"); err == nil {
+		t.Fatal("expected no match")
+	}
+}
+
+func TestParseAliasOutputBashAndZshFormats(t *testing.T) {
+	got := parseAliasOutput([]byte("alias ll='ls -l'\nalias say='echo '\\''hi'\\'''\nzz='echo z'\n"))
+	if got["ll"] != "ls -l" || got["say"] != "echo 'hi'" || got["zz"] != "echo z" {
+		t.Fatalf("aliases = %#v", got)
+	}
+}
+
+func TestParseAliasOutputSkipsNoise(t *testing.T) {
+	got := parseAliasOutput([]byte("\nnot an alias\n=bad\nalias ok=yes\n"))
+	if len(got) != 1 || got["ok"] != "yes" {
+		t.Fatalf("aliases = %#v", got)
+	}
+}
+
+func TestShellAliasCmdDetachesFromTerminal(t *testing.T) {
+	cmd := shellAliasCmd(t.Context(), "/bin/sh")
+	if cmd.SysProcAttr == nil || !cmd.SysProcAttr.Setsid {
+		t.Fatal("alias query must not own the terminal")
+	}
+}
+
+func TestSnapshotAtEverySplitPointConverges(t *testing.T) {
+	program := "hello \x1b[38;2;10;20;30mcolor\x1b[0m 中文✅ \x1b]2;the title\x07after \x1b_Gf=100;AAAABBBB\x1b\\done\r\n\x1b[1;31mbold\x1b[0m"
+	for split := 0; split <= len(program); split++ {
+		app := newVTerm(6, 40)
+		app.Write([]byte(program[:split]))
+		host := newVTerm(6, 40)
+		host.Write(app.Snapshot())
+		app.Write([]byte(program[split:]))
+		host.Write([]byte(program[split:]))
+		w, g := captureState(app), captureState(host)
+		if strings.Join(w.rows, "\n") != strings.Join(g.rows, "\n") || w.title != g.title || w.style != g.style {
+			t.Fatalf("split at %d (%q | %q):\n got %q title %q\nwant %q title %q", split, program[:split], program[split:], g.rows[:2], g.title, w.rows[:2], w.title)
+		}
+	}
+}
+
+func TestGlobalModesSurviveScreenSwitches(t *testing.T) {
+	assertSnapshotReplays(t, 4, 10, "\x1b[?7l\x1b[?25l\x1b[4 q\x1b[?1049hABCDEFGHIJKLM")
 	vt := newVTerm(4, 10)
-	vt.Write([]byte("e\u0301X"))
-	if vt.primary.grid[0].cells[0].ch != 'e' || vt.primary.grid[0].cells[0].combining != "\u0301" {
-		t.Fatalf("combining mark not attached to 'e': %+v", vt.primary.grid[0].cells[0])
-	}
-	if vt.primary.grid[0].cells[1].ch != 'X' {
-		t.Fatalf("cell[1] = %q, want 'X'", vt.primary.grid[0].cells[1].ch)
-	}
-
-	// 2. ICH shifts wide character intact without clearing its continuation cell.
-	vtICH := newVTerm(2, 5)
-	vtICH.Write([]byte("界X\r\x1b[@"))
-	if got := vtICH.ViewportRow(0).plainText(); got != " 界X" {
-		t.Fatalf("ICH corrupted wide char: got %q, want %q", got, " 界X")
-	}
-
-	// 3. DCH shifts surviving wide character intact.
-	vtDCH := newVTerm(2, 6)
-	vtDCH.Write([]byte("a界b\r\x1b[P"))
-	if got := vtDCH.ViewportRow(0).plainText(); got != "界b" {
-		t.Fatalf("DCH corrupted surviving wide char: got %q, want %q", got, "界b")
-	}
-
-	// 4. Erasing half a wide glyph uses current erase background color for both halves.
-	vtBCE := newVTerm(2, 6)
-	vtBCE.Write([]byte("\x1b[41m界\x1b[44m\x1b[H\x1b[X"))
-	if vtBCE.primary.grid[0].cells[0].style.bg.index != 4 || vtBCE.primary.grid[0].cells[1].style.bg.index != 4 {
-		t.Fatalf("wide overlap did not use current erase bg (4): cell0=%+v cell1=%+v",
-			vtBCE.primary.grid[0].cells[0].style.bg, vtBCE.primary.grid[0].cells[1].style.bg)
-	}
-
-	// 5. Wide glyph at right margin with DECAWM disabled (?7l) is ignored rather than stored as width 1.
-	vtNoWrap := newVTerm(2, 5)
-	vtNoWrap.Write([]byte("\x1b[?7lAAAA界"))
-	if got := vtNoWrap.ViewportRow(0).plainText(); got != "AAAA" {
-		t.Fatalf("DECAWM off wide char at margin = %q, want AAAA", got)
-	}
-
-	// 6. DEC Special Graphics line drawing.
-	vtACS := newVTerm(2, 10)
-	vtACS.Write([]byte("\x1b(0lqk\x1b(B"))
-	if got := vtACS.ViewportRow(0).plainText(); got != "┌─┐" {
-		t.Fatalf("DEC Special Graphics = %q, want ┌─┐", got)
-	}
-
-	// 7. Soft-wrap horizontal resize reflow preserves logical text across shrink and widen.
-	vtReflow := newVTerm(4, 8)
-	vtReflow.Write([]byte("abcdefgh"))
-	vtReflow.Resize(4, 4)
-	if vtReflow.ViewportRow(0).plainText() != "abcd" || vtReflow.ViewportRow(1).plainText() != "efgh" {
-		t.Fatalf("shrunk rows = %q / %q, want abcd / efgh", vtReflow.ViewportRow(0).plainText(), vtReflow.ViewportRow(1).plainText())
-	}
-	vtReflow.Resize(4, 8)
-	if got := vtReflow.ViewportRow(0).plainText(); got != "abcdefgh" {
-		t.Fatalf("widened row = %q, want abcdefgh", got)
+	vt.Write([]byte("\x1b[?7l\x1b[?25l\x1b[?1049hABCDEFGHIJKLM"))
+	if got := vt.alt.grid[0].plainText(); got != "ABCDEFGHIM" || vt.alt.cursorVis {
+		t.Fatalf("alt screen ignored global modes: %q visible=%v", got, vt.alt.cursorVis)
 	}
 }
 
-func TestAstraP2MouseWheelAndPageUpRoutingInAltScreenAndMouseMode(t *testing.T) {
-	var out bytes.Buffer
-	r := newClientSessionRenderer(&out, 6, 40, nil)
-	defer r.Close()
-
-	for i := 1; i <= 15; i++ {
-		_ = r.ProcessChunk([]byte(fmt.Sprintf("line-%02d\r\n", i)))
+func TestAltScreen1047SharesCursor(t *testing.T) {
+	app := newVTerm(6, 20)
+	app.Write([]byte("abc\x1b[?1047h\x1b[4;5Hin alt"))
+	host := newVTerm(6, 20)
+	host.Write(app.Snapshot())
+	for _, vt := range []*vterm{app, host} {
+		vt.Write([]byte("\x1b[?1047lX"))
 	}
-
-	// Primary screen without mouse mode: wheel and PageUp are consumed locally.
-	if !r.HandleInput([]byte("\x1b[<64;10;5M")) {
-		t.Fatal("wheel up should be consumed on primary screen when mouse tracking is off")
-	}
-	_ = r.HandleInput([]byte("a")) // reset scrollback
-
-	// Enable mouse tracking (?1000h): wheel should be forwarded to child app unless Shift is held.
-	_ = r.ProcessChunk([]byte("\x1b[?1000h"))
-	if r.HandleInput([]byte("\x1b[<64;10;5M")) {
-		t.Fatal("wheel up should be forwarded to child app when ?1000h mouse tracking is enabled")
-	}
-	if !r.HandleInput([]byte("\x1b[<68;10;5M")) { // cb=64|4 (Shift+WheelUp)
-		t.Fatal("Shift+WheelUp should still scroll local scrollback")
-	}
-	_ = r.HandleInput([]byte("a"))
-
-	// Enter alternate screen (?1049h): both wheel and PageUp must be forwarded to child app (vim/htop).
-	_ = r.ProcessChunk([]byte("\x1b[?1049h"))
-	if r.HandleInput([]byte("\x1b[<64;10;5M")) {
-		t.Fatal("wheel up must be forwarded in alternate screen")
-	}
-	if r.HandleInput([]byte("\x1b[5~")) {
-		t.Fatal("PageUp must be forwarded in alternate screen")
+	if a, h := captureState(app), captureState(host); a.curR != h.curR || a.curC != h.curC || a.curR != 3 {
+		t.Fatalf("cursor after 1047l: app %d,%d host %d,%d", a.curR, a.curC, h.curR, h.curC)
 	}
 }
 
-func TestHeldKeyRepeatZeroLagAndKittyKeyboardStack(t *testing.T) {
-	var out bytes.Buffer
-	var replies bytes.Buffer
-	r := newClientSessionRenderer(&out, 10, 40, nil)
-	r.SetReplyWriter(func(b []byte) {
-		replies.Write(b)
-	})
-	defer r.Close()
-
-	// 1. Initial full frame in legacy keyboard mode must NOT emit \x1b[=0;1u or \x1b[<1u or \x1b[>4;0m.
-	_ = r.ProcessChunk([]byte("ready"))
-	initialOut := out.String()
-	if strings.Contains(initialOut, "\x1b[=0;1u") || strings.Contains(initialOut, "\x1b[<1u") || strings.Contains(initialOut, "\x1b[>4;0m") {
-		t.Fatalf("legacy keyboard mode should not emit kitty/modifyOtherKeys reset on initial frame: %q", initialOut)
+func TestScrollbackIsBoundedByBytes(t *testing.T) {
+	vt := newVTerm(4, 1000)
+	line := strings.Repeat("\x1b[31mx\x1b[32my", 400) + "\r\n"
+	for i := 0; i < 3000; i++ {
+		vt.Write([]byte(line))
 	}
-
-	// 2. Legacy server query fallback: ?u and 6n are answered by client mirror when server did not send snap=end.
-	_ = r.ProcessChunk([]byte("\x1b[>3u\x1b[?u\x1b[6n"))
-	if !strings.Contains(replies.String(), "\x1b[?3u") || !strings.Contains(replies.String(), "\x1b[1;6R") {
-		t.Fatalf("legacy server query fallback failed, got replies: %q", replies.String())
+	total := 0
+	for _, l := range vt.scrollback {
+		total += len(l.ansi)
 	}
-	if !strings.Contains(out.String(), "\x1b[>3u") {
-		t.Fatalf("expected BlitEncoder to push \\x1b[>3u, got: %q", out.String())
+	if total != vt.scrollbackBytes || total > maxScrollbackBytes+maxScrollbackBytes/8 {
+		t.Fatalf("scrollback holds %d bytes (tracked %d)", total, vt.scrollbackBytes)
 	}
-
-	// 3. Updating Kitty keyboard flags replaces the single host stack entry (\x1b[<1u\x1b[>15u).
-	out.Reset()
-	_ = r.ProcessChunk([]byte("\x1b[=15;1u"))
-	if !strings.Contains(out.String(), "\x1b[<1u\x1b[>15u") {
-		t.Fatalf("expected Kitty stack replacement \\x1b[<1u\\x1b[>15u, got: %q", out.String())
+	if snap := vt.Snapshot(); len(snap) > 2*maxScrollbackBytes {
+		t.Fatalf("snapshot is %d bytes", len(snap))
 	}
+}
 
-	// 4. Held-key repeat across rows/columns settles with 0ms lag on every repeat.
-	for step := 1; step <= 8; step++ {
-		out.Reset()
-		_ = r.HandleInput([]byte("j"))
-		_ = r.ProcessChunk([]byte(fmt.Sprintf("\x1b[%d;%dH", step+1, step*3)))
-		wantCUP := fmt.Sprintf("\x1b[%d;%dH", step+1, step*3)
-		if !strings.Contains(out.String(), wantCUP) {
-			t.Fatalf("step %d: held-key repeat cursor move %q was throttled: %q", step, wantCUP, out.String())
+func TestStripTerminalReplies(t *testing.T) {
+	in := "a\x1b[12;40Rb\x1b[?62;22c\x1b[>1;10;0c\x1b[?2026;2$y\x1b[?1u\x1b[0n\x1b]11;rgb:0000/0000/0000\x07\x1bP1$r0m\x1b\\\x1b[8;24;80tc"
+	if got := string(stripTerminalReplies([]byte(in))); got != "abc" {
+		t.Fatalf("got %q", got)
+	}
+	keys := "\x1b[A\x1b[93;5u\x1b[200~text\x1b[201~\x1b[<0;3;4M\x1b[13~\x1bOR"
+	if got := string(stripTerminalReplies([]byte(keys))); got != keys {
+		t.Fatalf("keyboard input altered: %q", got)
+	}
+}
+
+func TestOnlyPrimaryClientAnswersQueries(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `stty -echo; while IFS= read -r line; do printf 'in:%s\n' "$line" | tr -d '\033'; done`)
+	first := attachTestClient(t, s.sock, 12, 60)
+	first.readUntil(t, "\x1b[?2026l")
+	second := attachTestClient(t, s.sock, 12, 60)
+	second.readUntil(t, "\x1b[?2026l")
+	first.send(t, "\x1b[3;4Rfirst\r")
+	second.send(t, "\x1b[3;4Rsecond\r")
+	// The first terminal is no longer primary: its reply is dropped, its typing is not.
+	second.readUntil(t, "in:first\r")
+	second.readUntil(t, "in:[3;4Rsecond\r")
+	_ = killSession(s.sock)
+	s.waitExit(t)
+}
+
+func TestInputKeyScanningAcrossReads(t *testing.T) {
+	k := &inputKeys{detach: 0x1d, switchKey: 0x1c}
+	steps := []struct {
+		in     string
+		fwd    string
+		action attachEnd
+		hit    bool
+	}{
+		{"\x1b[200~abc\x1b[20", "\x1b[200~abc\x1b[20", 0, false},
+		{"1~", "1~", 0, false},
+		{"\x1d", "", endDetach, true},
+	}
+	for i, st := range steps {
+		fwd, action, hit := k.scan([]byte(st.in))
+		if string(fwd) != st.fwd || action != st.action || hit != st.hit {
+			t.Fatalf("step %d: %q,%v,%v", i, fwd, action, hit)
 		}
 	}
-}
-
-func TestProgramStatusNegotiationAndSpinnerFallback(t *testing.T) {
-	// 1. OSC 7501;? capability probe must reply before DA1 and must not pollute agentState.
-	vt := newVTerm(10, 40)
-	vt.Write([]byte("\x1b[?u\x1b]7501;?\x1b\\\x1b[c"))
-	replies := string(vt.DrainReplies())
-	idx7501 := strings.Index(replies, "\x1b]7501;?\x1b\\")
-	idxDA1 := strings.Index(replies, "\x1b[?62;22c")
-	if idx7501 < 0 || idxDA1 < 0 || idx7501 >= idxDA1 {
-		t.Fatalf("expected 7501;? reply before DA1, got replies=%q", replies)
+	k = &inputKeys{detach: 0x1d, switchKey: 0x1c}
+	if _, _, hit := k.scan([]byte("x\x1b[20")); hit {
+		t.Fatal("unexpected hit")
 	}
-	if vt.agentState != "" || vt.sawOSC7501 {
-		t.Fatalf("7501;? query must not set agentState=%q or sawOSC7501=%v", vt.agentState, vt.sawOSC7501)
+	if _, _, hit := k.scan([]byte("0~paste \x1d")); hit {
+		t.Fatal("detach key inside a paste whose start marker was split")
 	}
-
-	// 2. Reattaching to a legacy server mid-turn (where OSC 7501 scrolled out of history)
-	// infers state=working from the active Braille spinner line and transitions when done.
-	var out bytes.Buffer
-	r := newClientSessionRenderer(&out, 10, 60, nil)
-	defer r.Close()
-
-	_ = r.ProcessChunk([]byte("previous output\r\n ⠸ Working\r\n"))
-	if !strings.Contains(out.String(), "\x1b]7501;state=working\x07") {
-		t.Fatalf("expected spinner fallback to emit state=working, got: %q", out.String())
+	k = &inputKeys{detach: 0x1d, switchKey: 0x1c}
+	if fwd, _, _ := k.scan([]byte("ab\x1b[93;")); string(fwd) != "ab\x1b[93;" {
+		t.Fatalf("forwarded %q", fwd)
 	}
-
-	out.Reset()
-	_ = r.ProcessChunk([]byte("\x1b]7501;state=done:app=pi\x1b\\"))
-	if !strings.Contains(out.String(), "\x1b]7501;state=idle:app=pi\x07") {
-		t.Fatalf("expected done transition to emit state=idle:app=pi, got: %q", out.String())
+	if fwd, action, hit := k.scan([]byte("5u")); !hit || action != endDetach || len(fwd) != 0 {
+		t.Fatalf("split kitty detach: %q %v %v", fwd, action, hit)
 	}
 }
 
+func TestServerKillEscalatesForStubbornPrograms(t *testing.T) {
+	s := startTestServer(t, "sh", "-c", `trap '' HUP TERM; printf 'ready\n'; while :; do sleep 1; done`)
+	c := attachTestClient(t, s.sock, 12, 60)
+	c.readUntil(t, "ready")
+	st, _ := querySession(s.sock, 0, 0)
+	start := time.Now()
+	if err := killSession(s.sock); err != nil {
+		t.Fatal(err)
+	}
+	s.waitExit(t)
+	if err := syscall.Kill(st.PID, 0); err == nil {
+		t.Fatalf("program %d survived kill", st.PID)
+	}
+	t.Logf("killed in %v", time.Since(start))
+}
 
+func TestHostRestoreKeepsCursorWhereProgramLeftIt(t *testing.T) {
+	for _, tc := range []struct {
+		name, program string
+	}{
+		{"plain", "line 1\r\nline 2\r\n  Goodbye!\r\n"},
+		{"margins and origin mode", "a\r\nb\r\nc\x1b[2;8r\x1b[?6h\x1b[3;4Hmid"},
+		{"exit while in alt screen", "shell$ cmd\r\n\x1b[?1049h\x1b[Hfull screen app\x1b[5;5H"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tracker, host := newVTerm(10, 30), newVTerm(10, 30)
+			tracker.Write([]byte(tc.program))
+			host.Write([]byte(tc.program))
+			want := newVTerm(10, 30)
+			want.Write([]byte(tc.program))
+			if want.inAltScreen {
+				want.Write([]byte("\x1b[?1049l"))
+			}
+			host.Write([]byte(hostRestoreSequence(tracker)))
+			scr := host.activeScreen()
+			if host.inAltScreen || scr.curR != want.primary.curR || scr.curC != want.primary.curC {
+				t.Fatalf("cursor at %d,%d (alt=%v), want %d,%d", scr.curR, scr.curC, host.inAltScreen, want.primary.curR, want.primary.curC)
+			}
+			if scr.scrollTop != 0 || scr.scrollBottom != scr.rows-1 || scr.originMode {
+				t.Fatal("margins or origin mode not reset")
+			}
+		})
+	}
+}
 
+// slowWriter stands in for a terminal that renders slowly.
+type slowWriter struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (w *slowWriter) Write(p []byte) (int, error) {
+	time.Sleep(time.Duration(len(p)/4096+1) * 5 * time.Millisecond)
+	w.mu.Lock()
+	w.n += len(p)
+	w.mu.Unlock()
+	return len(p), nil
+}
+
+func TestLegacyServerDoesNotDropClientBehindSlowTerminal(t *testing.T) {
+	// Older servers write each chunk with a 100ms deadline and drop the client
+	// when it is exceeded.
+	sock := filepath.Join(t.TempDir(), "old.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	const total = 4 << 20
+	dropped := make(chan bool, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		chunk := bytes.Repeat([]byte("transcript line ✅\r\n"), 64<<10/22)
+		for sent := 0; sent < total; sent += len(chunk) {
+			_ = conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+			if _, err := conn.Write(chunk); err != nil {
+				dropped <- true
+				return
+			}
+		}
+		dropped <- false
+		time.Sleep(200 * time.Millisecond)
+	}()
+	conn, err := dialSession(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	stream := &attachStream{conn: conn, legacy: true}
+	w := &slowWriter{}
+	out := &hostWriter{tracker: newVTerm(24, 80), w: w}
+	go stream.copyTo(out)
+	if <-dropped {
+		t.Fatal("the old server dropped the client")
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		w.mu.Lock()
+		n := w.n
+		w.mu.Unlock()
+		if n >= total-64<<10 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("terminal received %d of %d bytes", n, total)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestLegacySessionEndedDetectsServerExit(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "old.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacySessionEnded(sock) {
+		t.Fatal("a live session was reported as ended")
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		ln.Close() // removes the socket, as older servers do when the program exits
+	}()
+	if !legacySessionEnded(sock) {
+		t.Fatal("ended session not detected")
+	}
+}
