@@ -20,11 +20,21 @@ import (
 	"golang.org/x/term"
 )
 
+// sessionEntry is a line in the picker and in d --list. Sock is the socket of
+// a live session, or the restore record of an interrupted one.
 type sessionEntry struct {
 	Sock    string
 	Meta    sessionMeta
 	Status  sessionStatus
 	Current bool
+}
+
+// name is what --attach, --kill and --restore accept for the entry.
+func (e sessionEntry) name() string {
+	if isRestoreRecord(e.Sock) {
+		return strings.TrimSuffix(filepath.Base(e.Sock), ".json")
+	}
+	return sessionName(e.Sock)
 }
 
 // querySession asks a session for its status, plus a rendered preview when
@@ -125,10 +135,7 @@ func collectSessions(currentSock string) ([]sessionEntry, error) {
 		return nil, err
 	}
 	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	var socks []string
@@ -146,14 +153,25 @@ func collectSessions(currentSock string) ([]sessionEntry, error) {
 			defer wg.Done()
 			st, err := querySession(sock, 0, 0)
 			if err != nil {
-				if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ENOENT) {
+				if errors.Is(err, syscall.ECONNREFUSED) {
+					clearStaleSession(sock)
+				} else if errors.Is(err, syscall.ENOENT) {
 					removeSessionFiles(sock)
 				}
 				return
 			}
+			meta := readSessionMeta(sock)
+			if !st.Restore {
+				// An older server keeps no record of its own.
+				if st.State == "exited" {
+					forgetAdopted(sock)
+				} else {
+					adoptSession(sock, meta)
+				}
+			}
 			results[i] = &sessionEntry{
 				Sock:    sock,
-				Meta:    readSessionMeta(sock),
+				Meta:    meta,
 				Status:  st,
 				Current: currentSock != "" && sameSession(sock, currentSock),
 			}
@@ -167,7 +185,9 @@ func collectSessions(currentSock string) ([]sessionEntry, error) {
 		}
 	}
 	sortSessions(list)
-	return list, nil
+	// Interrupted sessions go last, after the cleanup above cleared the
+	// sockets of servers that are gone.
+	return append(list, collectInterrupted()...), nil
 }
 
 func stateRank(state string) int {
@@ -231,6 +251,8 @@ func styleForState(st sessionStatus, current bool) stateStyle {
 		return stateStyle{"◆", "有更新", "1;36"}
 	case "exited":
 		return stateStyle{"✕", "已退出", "31"}
+	case "interrupted":
+		return stateStyle{"⟲", "已中断", "1;34"}
 	default:
 		return stateStyle{"○", "空闲", "2"}
 	}
@@ -389,13 +411,13 @@ func listSessions() error {
 	}
 	nameW := 0
 	for _, e := range list {
-		nameW = max(nameW, runeDisplayWidth(sessionName(e.Sock)))
+		nameW = max(nameW, runeDisplayWidth(e.name()))
 	}
 	// Names go last and are what --attach/--detach/--kill accept.
 	cols := max(width-nameW-2, 80)
 	now := time.Now()
 	for _, e := range list {
-		fmt.Printf("%s  %s\n", e.columns(cols, tty, now), colorize(sessionName(e.Sock), "2", tty))
+		fmt.Printf("%s  %s\n", e.columns(cols, tty, now), colorize(e.name(), "2", tty))
 	}
 	return nil
 }
@@ -412,8 +434,9 @@ func pickAndAttach(query string) error {
 	return attachSession(selected)
 }
 
-// pickSession runs fzf over the sessions. currentSock is set when switching
-// from inside an attached session.
+// pickSession runs fzf over the sessions and returns the socket of the session
+// to show, starting one when the choice calls for it. currentSock is set when
+// switching from inside an attached session.
 func pickSession(currentSock, query string) (string, error) {
 	if _, err := exec.LookPath("fzf"); err != nil {
 		return "", errors.New("di: fzf is not installed (d --list works without it)")
@@ -425,12 +448,16 @@ func pickSession(currentSock, query string) (string, error) {
 	if len(list) == 0 {
 		return "", errors.New("di: no sessions; start one with: d <command>")
 	}
+	interrupted := false
+	for _, e := range list {
+		interrupted = interrupted || e.Status.State == "interrupted"
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		exe = os.Args[0]
 	}
 	width, height := terminalSize()
-	cmd := exec.Command("fzf", fzfArgs(exe, currentSock, query, height)...)
+	cmd := exec.Command("fzf", fzfArgs(exe, currentSock, query, height, interrupted)...)
 	cmd.Stdin = strings.NewReader(pickerLines(list, width))
 	cmd.Stderr = os.Stderr
 	out, err := cmd.Output()
@@ -441,17 +468,34 @@ func pickSession(currentSock, query string) (string, error) {
 		}
 		return "", err
 	}
-	selected, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\t")
-	return selected, nil
+	key, selected := parsePickerOutput(string(out))
+	if selected == "" {
+		return "", nil
+	}
+	return openPicked(selected, key == "ctrl-o")
 }
 
-func fzfArgs(exe, currentSock, query string, height int) []string {
+// parsePickerOutput splits fzf's --expect output into the key that ended the
+// picker (empty for Enter) and the selected entry's socket or record.
+func parsePickerOutput(out string) (key, selected string) {
+	key, line, _ := strings.Cut(out, "\n")
+	selected, _, _ = strings.Cut(strings.TrimSpace(line), "\t")
+	return strings.TrimSpace(key), selected
+}
+
+func fzfArgs(exe, currentSock, query string, height int, interrupted bool) []string {
 	self := shellQuote(exe)
 	reload := self + " --picker-list"
 	header := "Enter 进入 · Ctrl-X 结束会话 · Ctrl-R 刷新 · Esc 退出"
+	if interrupted {
+		header = "Enter 进入/恢复 · Ctrl-O 恢复到目录 · Ctrl-X 结束/删除 · Ctrl-R 刷新 · Esc 退出"
+	}
 	if currentSock != "" {
 		reload += " --current " + shellQuote(currentSock)
 		header = "Enter 切换 · Ctrl-\\ 下一个 · Ctrl-X 结束会话 · Ctrl-R 刷新 · Esc 返回"
+		if interrupted {
+			header = "Enter 切换/恢复 · Ctrl-\\ 下一个 · Ctrl-O 恢复到目录 · Ctrl-X 结束/删除 · Ctrl-R 刷新 · Esc 返回"
+		}
 	}
 	if height <= 0 {
 		height = 40
@@ -474,17 +518,22 @@ func fzfArgs(exe, currentSock, query string, height int) []string {
 		"--bind=ctrl-\\:down",
 		"--bind=ctrl-r:reload(" + reload + ")",
 		"--bind=ctrl-x:execute(" + self + " --kill-confirm {1})+reload(" + reload + ")",
+		"--expect=ctrl-o",
 	}
 	if query != "" {
 		args = append(args, "--query="+query)
 	}
-	if currentSock == "" {
+	// A lone interrupted session must not start again without being chosen.
+	if currentSock == "" && !interrupted {
 		args = append(args, "--select-1")
 	}
 	return args
 }
 
 func previewSession(sock string) error {
+	if isRestoreRecord(sock) {
+		return previewInterrupted(sock)
+	}
 	cols := positiveEnvInt("FZF_PREVIEW_COLUMNS", 120)
 	rows := positiveEnvInt("FZF_PREVIEW_LINES", 40)
 	// One line for the header, and one spare: fzf shows a scroll indicator over
@@ -515,11 +564,39 @@ func previewSession(sock string) error {
 	return nil
 }
 
+func previewInterrupted(path string) error {
+	rec, err := readRestoreRecord(path)
+	if err != nil {
+		fmt.Println("\x1b[2m(record is gone)\x1b[0m")
+		return nil
+	}
+	cols := positiveEnvInt("FZF_PREVIEW_COLUMNS", 120)
+	style := styleForState(sessionStatus{State: "interrupted"}, false)
+	command := displayText(strings.Join(rec.Command, " "))
+	dir := displayText(formatDisplayPWD(rec.PWD))
+	header := command + " · " + dir
+	if info, err := os.Stat(path); err == nil {
+		header += " · " + compactDuration(time.Since(info.ModTime())) + " ago"
+	}
+	fmt.Printf("%s \x1b[2m%s\x1b[0m\n\n", colorize(style.icon+" "+style.word, style.color, true),
+		fitField(header, max(cols-runeDisplayWidth(style.word)-3, 10)))
+	fmt.Println("  会话在命令结束前中断了，进程和画面都已经不在。")
+	fmt.Println()
+	fmt.Printf("  \x1b[1mEnter \x1b[0m  在 %s 重新运行 %s\n", dir, fitField(command, max(cols-runeDisplayWidth(dir)-20, 10)))
+	fmt.Printf("  \x1b[1mCtrl-O\x1b[0m  在 %s 打开 shell\n", dir)
+	fmt.Println("  \x1b[1mCtrl-X\x1b[0m  删除这条记录")
+	return nil
+}
+
 // killSession ends a running session or dismisses an exited one.
 func killSession(sock string) error {
 	st, err := querySession(sock, 0, 0)
 	if err != nil {
+		// Already gone; ending it means nothing should bring it back.
 		removeSessionFiles(sock)
+		if path, err := restorePath(sessionName(sock)); err == nil {
+			_ = os.Remove(path)
+		}
 		return nil
 	}
 	if st.Legacy {
@@ -625,6 +702,10 @@ func legacyServerProcesses(sock string) (server int, children []int) {
 }
 
 func confirmKillSession(sock string) error {
+	if isRestoreRecord(sock) {
+		_ = os.Remove(sock)
+		return nil
+	}
 	st, err := querySession(sock, 0, 0)
 	if err != nil {
 		return nil

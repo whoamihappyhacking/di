@@ -108,7 +108,9 @@ func maybeExecUpdatedBinary(sock string) {
 func attachOnce(sock string) (end attachEnd, code int, wasExited bool, target string, err error) {
 	conn, err := dialSession(sock)
 	if err != nil {
-		if !isSocket(sock) || errors.Is(err, syscall.ECONNREFUSED) {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			clearStaleSession(sock)
+		} else if !isSocket(sock) {
 			removeSessionFiles(sock)
 		}
 		return 0, 0, false, "", fmt.Errorf("di: session is gone: %s", cleanSessionName("", sock))

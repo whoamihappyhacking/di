@@ -18,14 +18,18 @@ import (
 	"github.com/creack/pty"
 )
 
-// TestMain points the session directory at a private location so no test can
-// ever list, query or attach to the user's real sessions.
+// TestMain points the session and state directories at a private location so
+// no test can ever list, query, attach to or restore the user's real sessions.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "di-test-run-")
 	if err != nil {
 		panic(err)
 	}
 	os.Setenv("XDG_RUNTIME_DIR", dir)
+	os.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state"))
+	// Run inside a di session, d would ask the user's terminal to switch over
+	// to whatever session a test starts.
+	os.Unsetenv("DI_SESSION")
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -395,8 +399,8 @@ func TestPickerColumnsAlign(t *testing.T) {
 }
 
 func TestFZFArgs(t *testing.T) {
-	args := strings.Join(fzfArgs("/bin/d", "/run/di/x.sock", "", 40), "\n")
-	for _, want := range []string{"--ansi", "--with-nth=2..", "--preview='/bin/d' --preview {1}", "--bind=ctrl-\\:down", "--current '/run/di/x.sock'", "--kill-confirm {1}"} {
+	args := strings.Join(fzfArgs("/bin/d", "/run/di/x.sock", "", 40, false), "\n")
+	for _, want := range []string{"--ansi", "--with-nth=2..", "--preview='/bin/d' --preview {1}", "--bind=ctrl-\\:down", "--current '/run/di/x.sock'", "--kill-confirm {1}", "--expect=ctrl-o"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("fzf args missing %q:\n%s", want, args)
 		}
@@ -404,8 +408,25 @@ func TestFZFArgs(t *testing.T) {
 	if strings.Contains(args, "--select-1") {
 		t.Error("switching must always show the picker")
 	}
-	if !strings.Contains(strings.Join(fzfArgs("/bin/d", "", "cod", 40), "\n"), "--query=cod") {
-		t.Error("query not passed to fzf")
+	top := strings.Join(fzfArgs("/bin/d", "", "cod", 40, false), "\n")
+	if !strings.Contains(top, "--query=cod") || !strings.Contains(top, "--select-1") {
+		t.Errorf("top-level picker args:\n%s", top)
+	}
+	withInterrupted := strings.Join(fzfArgs("/bin/d", "", "cod", 40, true), "\n")
+	if strings.Contains(withInterrupted, "--select-1") || !strings.Contains(withInterrupted, "Ctrl-O 恢复到目录") {
+		t.Errorf("an interrupted session must never be picked without asking:\n%s", withInterrupted)
+	}
+}
+
+func TestParsePickerOutput(t *testing.T) {
+	for _, tc := range []struct{ out, key, selected string }{
+		{"\n/run/di/a.sock\t● 运行中 ~\n", "", "/run/di/a.sock"},
+		{"ctrl-o\n/state/di/restore/b.json\t⟲ 已中断 ~\n", "ctrl-o", "/state/di/restore/b.json"},
+		{"", "", ""},
+	} {
+		if key, selected := parsePickerOutput(tc.out); key != tc.key || selected != tc.selected {
+			t.Errorf("parsePickerOutput(%q) = %q, %q", tc.out, key, selected)
+		}
 	}
 }
 

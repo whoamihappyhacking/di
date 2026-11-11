@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -84,7 +85,10 @@ type sessionStatus struct {
 	Rows       int       `json:"rows,omitempty"`
 	Cols       int       `json:"cols,omitempty"`
 	Screen     string    `json:"screen,omitempty"`
-	Legacy     bool      `json:"-"`
+	// Restore is set by servers that keep their own restore record; clients
+	// write one for sessions run by older builds.
+	Restore bool `json:"restore,omitempty"`
+	Legacy  bool `json:"-"`
 }
 
 type sessionServer struct {
@@ -112,6 +116,16 @@ type sessionServer struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
+	// restorePath is this session's restore record, kept while the command
+	// runs; restoreData is its content, to put it back when the command's
+	// exit turns out to have been part of a shutdown. terminated is set when
+	// the server itself is told to stop, as on a system shutdown; the record
+	// then stays to mark the interruption.
+	restorePath      string
+	restoreData      []byte
+	restoreDroppedAt time.Time
+	terminated       bool
+
 	lastOutput  time.Time
 	lastSeen    time.Time
 	attention   bool
@@ -135,6 +149,16 @@ func runServer(args []string) error {
 	defer os.Remove(metaPath(sock))
 	defer os.Remove(sock)
 	defer ln.Close()
+	// The record is written once the socket exists, so a record without a
+	// socket always means the server went away.
+	var restorePath string
+	var restoreData []byte
+	if meta := readSessionMeta(sock); len(meta.Command) > 0 {
+		restorePath, restoreData, err = writeRestoreRecord(sock, meta, false)
+		if err != nil {
+			restorePath = "" // the session runs all the same, just without a record
+		}
+	}
 
 	master, slave, err := pty.Open()
 	if err != nil {
@@ -162,7 +186,22 @@ func runServer(args []string) error {
 		firstAttach: make(chan struct{}),
 		childDone:   make(chan struct{}),
 		done:        make(chan struct{}),
+
+		restorePath: restorePath,
+		restoreData: restoreData,
 	}
+	sigs := make(chan os.Signal, 1)
+	// What a system shutdown sends; the server has no terminal to get them from.
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigs)
+	go func() {
+		select {
+		case <-sigs:
+			s.terminate()
+		case <-s.done:
+		}
+	}()
+	go s.restoreHeartbeat()
 	go s.acceptLoop(ln)
 
 	// Start the program once the launching client is attached, so terminal
@@ -173,9 +212,9 @@ func runServer(args []string) error {
 	case <-s.done:
 	}
 	s.mu.Lock()
-	killed := s.killed
+	killed, terminated := s.killed, s.terminated
 	s.mu.Unlock()
-	if killed {
+	if killed || terminated {
 		_ = slave.Close()
 		s.shutdown()
 	} else if err := cmd.Start(); err != nil {
@@ -197,12 +236,16 @@ func runServer(args []string) error {
 			s.mu.Lock()
 			s.childExitCode = code
 			s.mu.Unlock()
+			s.dropRestore()
 			close(s.childDone)
 		}()
 		go s.readPTY()
 	}
 
 	<-s.done
+	// The record goes before the socket, so no client ever sees a record
+	// without a socket for a session that simply ended.
+	s.dropRestore()
 	_ = ln.Close()
 	s.mu.Lock()
 	for c := range s.clients {
@@ -238,6 +281,52 @@ func filterInternalEnv(env []string) []string {
 
 func (s *sessionServer) shutdown() {
 	s.closeOnce.Do(func() { close(s.done) })
+}
+
+// terminate stops the server on a signal, as when the system shuts down. The
+// program loses its terminal with the server, and the restore record stays.
+func (s *sessionServer) terminate() {
+	s.mu.Lock()
+	s.terminated = true
+	// A shutdown signals every process at once, so the command may have
+	// exited just before this signal arrived: it was interrupted all the same.
+	if !s.restoreDroppedAt.IsZero() && time.Since(s.restoreDroppedAt) < restoreGrace && !s.killed {
+		_ = writeFileAtomic(s.restorePath, s.restoreData)
+	}
+	s.mu.Unlock()
+	s.shutdown()
+}
+
+// dropRestore removes the restore record once the session has ended for good.
+func (s *sessionServer) dropRestore() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.restorePath == "" || s.terminated || !s.restoreDroppedAt.IsZero() {
+		return
+	}
+	_ = os.Remove(s.restorePath)
+	s.restoreDroppedAt = time.Now()
+}
+
+// restoreHeartbeat refreshes the record's mtime while the command runs, so a
+// record left behind dates the interruption.
+func (s *sessionServer) restoreHeartbeat() {
+	if s.restorePath == "" {
+		return
+	}
+	tick := time.NewTicker(restoreHeartbeat)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			now := time.Now()
+			_ = os.Chtimes(s.restorePath, now, now)
+		case <-s.childDone:
+			return
+		case <-s.done:
+			return
+		}
+	}
 }
 
 func (s *sessionServer) acceptLoop(ln net.Listener) {
@@ -550,6 +639,7 @@ func (s *sessionServer) status(previewRows, previewCols int) sessionStatus {
 		PID:        s.pid,
 		Rows:       s.rows,
 		Cols:       s.cols,
+		Restore:    true,
 	}
 	st.Activity, st.Summary = s.vt.Summary()
 	if !s.attention {

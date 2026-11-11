@@ -77,10 +77,21 @@ func run(prog string, args []string) error {
 				return errors.New("usage: d --kill <name>")
 			}
 			sock, err := resolveSession(args[1])
+			if errors.Is(err, errNoSession) {
+				// Dismiss an interrupted session instead.
+				if path, ierr := resolveInterrupted(args[1]); ierr == nil {
+					return os.Remove(path)
+				}
+			}
 			if err != nil {
 				return err
 			}
 			return killSession(sock)
+		case "--restore", "--restore-dir":
+			if len(args) < 2 {
+				return fmt.Errorf("usage: d %s <name>", args[0])
+			}
+			return restoreByName(args[1], args[0] == "--restore-dir")
 		case "--kill-confirm":
 			if len(args) < 2 {
 				return nil
@@ -101,32 +112,49 @@ func runD(args []string) error {
 	if strings.HasPrefix(args[0], "-") {
 		return fmt.Errorf("d: unknown option %s\n%s", args[0], usage())
 	}
+	sock, err := startSession(args)
+	if err != nil {
+		return err
+	}
+	return enterSession(sock)
+}
+
+// startSession starts a session for args in the current directory and
+// returns its socket once the server is listening.
+func startSession(args []string) (string, error) {
 	commandArgs := expandCommandAlias(args)
 	if _, err := exec.LookPath(commandArgs[0]); err != nil {
-		return fmt.Errorf("d: %s: command not found", args[0])
+		return "", fmt.Errorf("d: %s: command not found", args[0])
 	}
 	dir, err := sessionDir()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return "", err
 	}
 	sock, err := uniqueSocketPath(dir, labelFor(args))
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := writeSessionMeta(sock, args); err != nil {
-		return err
+		return "", err
 	}
 	if err := startServer(sock, commandArgs); err != nil {
 		_ = os.Remove(metaPath(sock))
-		return err
+		return "", err
 	}
 	if err := waitSocket(sock, serverStartWait); err != nil {
 		_ = os.Remove(metaPath(sock))
-		return err
+		return "", err
 	}
+	return sock, nil
+}
+
+// enterSession shows a session that was just started: the terminal attached
+// to the session this runs in switches over, a terminal attaches, and anything
+// else leaves it running in the background.
+func enterSession(sock string) error {
 	if outer := insideSession(); outer != "" && requestSwitch(outer, sock) {
 		// The terminal showing this session switches over; nothing is nested.
 		return nil
@@ -139,7 +167,7 @@ func runD(args []string) error {
 }
 
 func usage() string {
-	return "usage: d <command> [args...]\n       di [query]\n       d --list | --attach <name> | --detach <name> | --kill <name>\n       d install"
+	return "usage: d <command> [args...]\n       di [query]\n       d --list | --attach <name> | --detach <name> | --kill <name>\n       d --restore <name> | --restore-dir <name>\n       d install"
 }
 
 func helpText() string {
@@ -151,7 +179,12 @@ Usage:
   d --list                    list sessions with their state
   d --attach <name>           attach to a session by name (unique prefix or substring)
   d --detach <name>           detach every client attached to a session
-  d --kill <name>             end a session (or dismiss one that has exited)
+  d --kill <name>             end a session (or dismiss one that has exited
+                              or was interrupted)
+  d --restore <name>          run an interrupted session's command again in
+                              its directory
+  d --restore-dir <name>      start a shell in an interrupted session's
+                              directory
   d install                   install this binary as ~/.local/bin/d and link di
   d --help, di --help         show this help
 
@@ -160,9 +193,11 @@ Keys while attached:
   Ctrl-\                      switch to another session
 
 Keys in the picker:
-  Enter                       attach
+  Enter                       attach; restore an interrupted session
+  Ctrl-O                      start a shell in the selected session's directory
+                              (an interrupted session is restored that way)
   Ctrl-\                      move to the next session
-  Ctrl-X                      end the selected session
+  Ctrl-X                      end the selected session; dismiss an interrupted one
   Ctrl-R                      refresh states
 
 Session states:
@@ -171,6 +206,8 @@ Session states:
   ◆ 有更新 new                went quiet with output you have not seen yet
   ○ 空闲   idle               nothing new since you last looked
   ✕ 已退出 exited             the command ended; attach once to see its last screen
+  ⟲ 已中断 interrupted        was running when the machine went down or its
+                              server was killed; kept for 7 days
 
 Output passes straight through while attached, so scrollback, mouse, colors and
 key handling behave exactly as when the command runs in the terminal directly.
@@ -360,15 +397,32 @@ func resolveSession(arg string) (string, error) {
 		return exact, nil
 	}
 	entries, _ := os.ReadDir(dir)
-	var prefix, contains []string
+	var names []string
 	for _, e := range entries {
-		name, ok := strings.CutSuffix(e.Name(), ".sock")
-		if !ok {
-			continue
+		if name, ok := strings.CutSuffix(e.Name(), ".sock"); ok {
+			names = append(names, name)
 		}
-		if strings.HasPrefix(name, arg) {
+	}
+	name, err := matchSessionName(names, arg)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, name+".sock"), nil
+}
+
+var errNoSession = errors.New("d: no session matches")
+
+// matchSessionName picks the one name that equals arg, starts with it, or
+// failing that contains it.
+func matchSessionName(names []string, arg string) (string, error) {
+	var prefix, contains []string
+	for _, name := range names {
+		switch {
+		case name == arg:
+			return name, nil
+		case strings.HasPrefix(name, arg):
 			prefix = append(prefix, name)
-		} else if strings.Contains(name, arg) {
+		case strings.Contains(name, arg):
 			contains = append(contains, name)
 		}
 	}
@@ -377,12 +431,12 @@ func resolveSession(arg string) (string, error) {
 		case 0:
 			continue
 		case 1:
-			return filepath.Join(dir, matches[0]+".sock"), nil
+			return matches[0], nil
 		default:
 			return "", fmt.Errorf("d: %q matches several sessions:\n  %s", arg, strings.Join(matches, "\n  "))
 		}
 	}
-	return "", fmt.Errorf("d: no session matches %q", arg)
+	return "", fmt.Errorf("%w %q", errNoSession, arg)
 }
 
 func labelFor(args []string) string {
