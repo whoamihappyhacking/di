@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -279,18 +280,23 @@ type vterm struct {
 	activeCharset int
 
 	// Metadata.
-	title       string
-	cwd         string
-	agentState  string // body of the last OSC 7501 state report
-	progressSeq string // OSC 9;4 progress
-	bells       int
-	notices     int
-	lastNotice  string
+	title           string
+	cwd             string
+	agentState      string // body of the last OSC 7501 state report
+	sawNative7501   bool   // true once the child emits OSC 7501 directly
+	derivedPriority int    // 0=none, 1=title, 2=OSC 9;4
+	derivedState    string // "", "idle", "working", "blocked", "error", "done"
+	titleSpinner    bool   // last OSC 0/2 title carried a working spinner
+	progressSeq     string // OSC 9;4 progress
+	bells           int
+	notices         int
+	lastNotice      string
 
 	lastPrintedCh        rune
 	lastPrintedCombining string
 	pendingReplies       bytes.Buffer
 	statusReplies        bytes.Buffer // replies only di can give (OSC 7501 capability)
+	syntheticStatus      bytes.Buffer // OSC 7501 sequences synthesized from title/progress for outer terminals
 
 	// Legacy di snapshot stream markers (OSC 7502), used to read old servers.
 	sawSnapshotEnd bool
@@ -352,6 +358,15 @@ func (vt *vterm) DrainStatusReplies() []byte {
 	}
 	out := append([]byte(nil), vt.statusReplies.Bytes()...)
 	vt.statusReplies.Reset()
+	return out
+}
+
+func (vt *vterm) DrainSyntheticStatus() []byte {
+	if vt.syntheticStatus.Len() == 0 {
+		return nil
+	}
+	out := append([]byte(nil), vt.syntheticStatus.Bytes()...)
+	vt.syntheticStatus.Reset()
 	return out
 }
 
@@ -920,6 +935,77 @@ func (vt *vterm) stepDCS(b byte) {
 	}
 }
 
+var (
+	oscTitleSpinningRe = regexp.MustCompile(`(?i)^(?:(?:π\s+)?[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]|(?:@|▃\s*▅\s*▂|🦀π)\s+rpi(?:\s*·\s*🦀)?\s+[⟳↻](?:\s|$))`)
+	oscTitleBlockedRe  = regexp.MustCompile(`(?i)^(?:π\s+!(?:\s|$)|(?:\[\s*[!.]\s*\]\s*)?(?:action required|waiting for (?:input|permission|approval))\b)`)
+	oscTitleWorkingRe  = regexp.MustCompile(`(?i)^(?:working|thinking|running|processing|starting)(?:\s*[|·—-]|$)`)
+	oscTitleErrorRe    = regexp.MustCompile(`(?i)^(?:error|failed)(?:\s*[|·—-]|$)`)
+	oscTitleDoneRe     = regexp.MustCompile(`(?i)^(?:π\s+>(?:\s|$)|(?:@|▃\s*▅\s*▂|🦀π)\s+rpi(?:\s*·\s*🦀)?$|(?:ready|idle|done|complete|completed)(?:\s*[|·—-]|$))`)
+)
+
+func (vt *vterm) setDerivedStatus(next string, priority int) {
+	if vt.sawNative7501 || priority < vt.derivedPriority {
+		return
+	}
+	vt.derivedPriority = priority
+	if vt.derivedState == next {
+		return
+	}
+	vt.derivedState = next
+	if next == "done" {
+		vt.agentState = "state=idle"
+	} else {
+		vt.agentState = "state=" + next
+	}
+	fmt.Fprintf(&vt.syntheticStatus, "\x1b]7501;state=%s\x07", next)
+}
+
+func (vt *vterm) observeTitleStatus(title string) {
+	if vt.sawNative7501 || vt.derivedPriority > 1 {
+		return
+	}
+	spinning := oscTitleSpinningRe.MatchString(title)
+	switch {
+	case oscTitleBlockedRe.MatchString(title):
+		vt.setDerivedStatus("blocked", 1)
+	case spinning || oscTitleWorkingRe.MatchString(title):
+		vt.setDerivedStatus("working", 1)
+	case oscTitleErrorRe.MatchString(title):
+		vt.setDerivedStatus("error", 1)
+	case oscTitleDoneRe.MatchString(title) || (vt.titleSpinner && vt.derivedState == "working" && title != ""):
+		if vt.derivedState == "working" {
+			vt.setDerivedStatus("done", 1)
+		} else if vt.derivedState != "done" && vt.derivedState != "error" {
+			vt.setDerivedStatus("idle", 1)
+		}
+	}
+	vt.titleSpinner = spinning
+}
+
+func (vt *vterm) observeProgressStatus(rest string) {
+	if vt.sawNative7501 {
+		return
+	}
+	parts := strings.Split(rest, ";")
+	if len(parts) < 2 || parts[0] != "4" {
+		return
+	}
+	switch parts[1] {
+	case "1", "3":
+		vt.setDerivedStatus("working", 2)
+	case "2":
+		vt.setDerivedStatus("error", 2)
+	case "4":
+		vt.setDerivedStatus("blocked", 2)
+	case "0":
+		if vt.derivedState == "working" {
+			vt.setDerivedStatus("done", 2)
+		} else if vt.derivedState != "done" && vt.derivedState != "error" {
+			vt.setDerivedStatus("idle", 2)
+		}
+	}
+}
+
 func (vt *vterm) dispatchOSC(payload string) {
 	code, rest, ok := strings.Cut(payload, ";")
 	if !ok {
@@ -928,6 +1014,7 @@ func (vt *vterm) dispatchOSC(payload string) {
 	switch code {
 	case "0", "2":
 		vt.title = strings.TrimSpace(rest)
+		vt.observeTitleStatus(vt.title)
 	case "7":
 		vt.cwd = strings.TrimSpace(rest)
 	case "8":
@@ -942,6 +1029,7 @@ func (vt *vterm) dispatchOSC(payload string) {
 			if strings.HasPrefix(rest, "4;0") {
 				vt.progressSeq = ""
 			}
+			vt.observeProgressStatus(rest)
 		} else {
 			// iTerm2-style desktop notification.
 			vt.notices++
@@ -967,6 +1055,10 @@ func (vt *vterm) dispatchOSC(payload string) {
 			vt.statusReplies.WriteString("\x1b]7501;?\x1b\\")
 			return
 		}
+		vt.sawNative7501 = true
+		vt.derivedPriority = 0
+		vt.derivedState = ""
+		vt.titleSpinner = false
 		switch {
 		case strings.Contains(s, "state=done"):
 			vt.agentState = strings.Replace(s, "state=done", "state=idle", 1)
@@ -1557,7 +1649,7 @@ func (vt *vterm) resetFull() {
 	rows, cols := vt.primary.rows, vt.primary.cols
 	scrollback, scrollbackBytes, maxScrollback := vt.scrollback, vt.scrollbackBytes, vt.maxScrollback
 	bells, notices, lastNotice := vt.bells, vt.notices, vt.lastNotice
-	replies, statusReplies := vt.DrainReplies(), vt.DrainStatusReplies()
+	replies, statusReplies, synthStatus := vt.DrainReplies(), vt.DrainStatusReplies(), vt.DrainSyntheticStatus()
 	*vt = vterm{
 		primary:         newVTermScreen(rows, cols),
 		alt:             newVTermScreen(rows, cols),
@@ -1572,6 +1664,7 @@ func (vt *vterm) resetFull() {
 	}
 	vt.pendingReplies.Write(replies)
 	vt.statusReplies.Write(statusReplies)
+	vt.syntheticStatus.Write(synthStatus)
 }
 
 func (vt *vterm) handleSGR(raw string) {

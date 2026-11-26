@@ -366,8 +366,12 @@ func (s *sessionServer) handleOutput(p []byte) {
 	s.bellsSeen, s.noticesSeen = s.vt.bells, s.vt.notices
 	replies := s.vt.DrainReplies()
 	statusReplies := s.vt.DrainStatusReplies()
+	synthStatus := s.vt.DrainSyntheticStatus()
 	for c := range s.clients {
 		c.sendOutput(p, s.vt)
+		if len(synthStatus) > 0 {
+			c.sendOutput(synthStatus, s.vt)
+		}
 	}
 	s.mu.Unlock()
 	// While a terminal is attached it answers queries itself; otherwise answer

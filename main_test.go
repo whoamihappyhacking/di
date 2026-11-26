@@ -1229,3 +1229,72 @@ func TestLegacySessionEndedDetectsServerExit(t *testing.T) {
 		t.Fatal("ended session not detected")
 	}
 }
+
+func TestVTermSynthesizesOSC7501FromTitleAndProgress(t *testing.T) {
+	vt := newVTerm(10, 40)
+
+	// rpi working title -> working + synthetic OSC 7501.
+	vt.Write([]byte("\x1b]2;@ rpi ⟳\x07"))
+	if vt.agentState != "state=working" {
+		t.Fatalf("agentState = %q, want state=working", vt.agentState)
+	}
+	if got := string(vt.DrainSyntheticStatus()); got != "\x1b]7501;state=working\x07" {
+		t.Fatalf("synthetic = %q, want working OSC 7501", got)
+	}
+	// Retry title keeps working without duplicate emission.
+	vt.Write([]byte("\x1b]2;@ rpi ↻\x07"))
+	if got := string(vt.DrainSyntheticStatus()); got != "" {
+		t.Fatalf("unexpected duplicate synthetic on retry: %q", got)
+	}
+	// Snapshot carries working state for reattaching terminals.
+	if !strings.Contains(string(vt.Snapshot()), "\x1b]7501;state=working\x07") {
+		t.Fatal("snapshot missing derived state=working")
+	}
+	// Settled rpi title -> emits state=done live, stores state=idle for snapshot.
+	vt.Write([]byte("\x1b]2;@ rpi\x07"))
+	if vt.agentState != "state=idle" {
+		t.Fatalf("agentState after settle = %q, want state=idle", vt.agentState)
+	}
+	if got := string(vt.DrainSyntheticStatus()); got != "\x1b]7501;state=done\x07" {
+		t.Fatalf("synthetic after settle = %q, want state=done", got)
+	}
+	// Second turn transitions cleanly back to working.
+	vt.Write([]byte("\x1b]2;@ rpi ⟳\x07"))
+	if got := string(vt.DrainSyntheticStatus()); got != "\x1b]7501;state=working\x07" {
+		t.Fatalf("second turn synthetic = %q, want state=working", got)
+	}
+	// Legacy rpi title format also settles.
+	vt.Write([]byte("\x1b]2;▃ ▅ ▂ rpi · 🦀\x07"))
+	if got := string(vt.DrainSyntheticStatus()); got != "\x1b]7501;state=done\x07" {
+		t.Fatalf("legacy rpi settle synthetic = %q, want state=done", got)
+	}
+
+	// Once native OSC 7501 is observed, title/progress synthesis yields permanently.
+	vt.Write([]byte("\x1b]7501;state=working\x07"))
+	_ = vt.DrainSyntheticStatus()
+	vt.Write([]byte("\x1b]2;@ rpi\x07\x1b]9;4;0;0\x07"))
+	if vt.agentState != "state=working" {
+		t.Fatalf("native 7501 overwritten by title/progress: %q", vt.agentState)
+	}
+	if got := string(vt.DrainSyntheticStatus()); got != "" {
+		t.Fatalf("unexpected synthetic after native 7501: %q", got)
+	}
+}
+
+func TestSessionAttachArgvAdvertising(t *testing.T) {
+	sock := "/run/user/1000/di/rpi-abc-123.sock"
+	cmd := []string{"rpi"}
+	if !argvAdvertisesSession([]string{"d", "rpi"}, sock, cmd) {
+		t.Fatal("direct `d rpi` should already advertise session command")
+	}
+	if argvAdvertisesSession([]string{"di"}, sock, cmd) {
+		t.Fatal("bare `di` must re-exec to advertise attached session command")
+	}
+	if argvAdvertisesSession([]string{"d", "agy", "--yolo"}, sock, cmd) {
+		t.Fatal("switched `d agy` session must re-exec to advertise new command")
+	}
+	want := sessionAttachArgv("di", sock, cmd)
+	if !argvAdvertisesSession(want, sock, cmd) {
+		t.Fatalf("sessionAttachArgv %v must satisfy argvAdvertisesSession", want)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,7 +43,7 @@ func attachSession(sock string) error {
 		if self := os.Getenv("DI_SESSION"); self != "" && sameSession(self, current) {
 			return errors.New("di: refusing to attach a session to itself")
 		}
-		maybeExecUpdatedBinary(current)
+		maybeExecSessionBinary(current)
 		end, code, wasExited, target, err := attachOnce(current)
 		if err != nil {
 			return err
@@ -92,15 +93,65 @@ func sameSession(a, b string) bool {
 	return filepath.Clean(a) == filepath.Clean(b)
 }
 
-func maybeExecUpdatedBinary(sock string) {
-	link, err := os.Readlink("/proc/self/exe")
-	if err != nil || !strings.HasSuffix(link, " (deleted)") {
+func sessionAttachArgv(prog, sock string, cmd []string) []string {
+	args := make([]string, 0, 4+len(cmd))
+	args = append(args, prog, "--attach", sock)
+	if len(cmd) > 0 {
+		args = append(args, "--")
+		args = append(args, cmd...)
+	}
+	return args
+}
+
+func argvAdvertisesSession(args []string, sock string, cmd []string) bool {
+	if len(cmd) == 0 {
+		return true
+	}
+	if len(args) == 1+len(cmd) && slices.Equal(args[1:], cmd) {
+		return true
+	}
+	if len(args) > 0 && slices.Equal(args, sessionAttachArgv(args[0], sock, cmd)) {
+		return true
+	}
+	return false
+}
+
+// maybeExecSessionBinary re-execs into a newer binary on disk (if replaced
+// since launch) or updates this client process's argv to expose the attached
+// session's command ("-- <cmd...>") in /proc/<pid>/cmdline so outer terminals
+// can identify the wrapped program generically from OS process metadata.
+func maybeExecSessionBinary(sock string) {
+	diskPath, updated := currentExecutablePath()
+	if diskPath == "" {
 		return
 	}
-	diskPath := strings.TrimSuffix(link, " (deleted)")
-	if info, statErr := os.Stat(diskPath); statErr == nil && !info.IsDir() {
-		_ = syscall.Exec(diskPath, []string{os.Args[0], "--attach", sock}, os.Environ())
+	meta := readSessionMeta(sock)
+	if !updated && argvAdvertisesSession(os.Args, sock, meta.Command) {
+		return
 	}
+	info, err := os.Stat(diskPath)
+	if err != nil || info.IsDir() {
+		return
+	}
+	prog := "di"
+	if len(os.Args) > 0 && os.Args[0] != "" {
+		prog = os.Args[0]
+	}
+	_ = syscall.Exec(diskPath, sessionAttachArgv(prog, sock, meta.Command), os.Environ())
+}
+
+func currentExecutablePath() (path string, updated bool) {
+	if link, err := os.Readlink("/proc/self/exe"); err == nil && link != "" {
+		if trimmed, cut := strings.CutSuffix(link, " (deleted)"); cut {
+			return trimmed, true
+		}
+		return link, false
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", false
+	}
+	return exe, false
 }
 
 // attachOnce connects to a session and passes bytes straight through until
@@ -213,6 +264,7 @@ func (h *hostWriter) write(p []byte) error {
 	h.tracker.Write(p)
 	h.tracker.DrainReplies()
 	h.tracker.DrainStatusReplies()
+	h.tracker.DrainSyntheticStatus()
 	h.mu.Unlock()
 	_, err := h.w.Write(p)
 	return err
